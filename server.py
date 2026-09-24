@@ -9,6 +9,8 @@ from typing import Any, Iterable
 
 import httpx
 from mcp.server import MCPServer
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 BASE_URL = "https://api.upbit.com"
 TIMEOUT = httpx.Timeout(15.0, connect=8.0)
@@ -519,6 +521,104 @@ async def scan_krw_market(
         "top_candidates": valid[:top_n],
         "shortlist_results": analyzed,
     }
+
+
+MOBILE_HTML = r'''<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0d12" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Upbit Full Check</title>
+  <style>
+    :root{--bg:#0b0d12;--card:#151923;--line:#262c3a;--txt:#f4f7fb;--muted:#9ba7ba;--accent:#5da8ff;--good:#35d07f;--bad:#ff6472}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}
+    .wrap{max-width:820px;margin:auto;padding:20px 14px 80px}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:8px 0 18px}
+    h1{font-size:24px;margin:0 0 5px}.sub{font-size:13px;color:var(--muted);line-height:1.5}.badge{border:1px solid var(--line);padding:7px 10px;border-radius:999px;font-size:12px;color:var(--muted);white-space:nowrap}
+    .panel{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:15px;margin:12px 0}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+    button{appearance:none;border:0;border-radius:13px;padding:13px 16px;font-weight:800;font-size:15px;background:var(--accent);color:#05101d;cursor:pointer}button.secondary{background:#232a38;color:var(--txt);border:1px solid var(--line)}button:disabled{opacity:.55}
+    input{flex:1;min-width:160px;background:#0f131b;border:1px solid var(--line);border-radius:12px;padding:13px 14px;color:var(--txt);font-size:15px;text-transform:uppercase}
+    .status{font-size:13px;color:var(--muted);margin-top:10px;min-height:20px}.status.good{color:var(--good)}.status.bad{color:var(--bad)}
+    .cards{display:grid;grid-template-columns:1fr;gap:10px}.coin{border:1px solid var(--line);border-radius:16px;padding:14px;background:#10141c}
+    .coinTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.rank{font-size:13px;color:var(--muted)}.market{font-size:19px;font-weight:900}.price{font-size:18px;font-weight:800;text-align:right}
+    .chg.up{color:var(--good)}.chg.down{color:var(--bad)}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:12px}.metric{background:#0b0f16;border:1px solid #202634;border-radius:12px;padding:10px}.k{font-size:11px;color:var(--muted)}.v{font-size:14px;font-weight:800;margin-top:3px;word-break:break-word}
+    .tf{margin-top:11px;padding-top:11px;border-top:1px solid var(--line)}.tfline{font-size:12px;color:#c6cfdd;line-height:1.8}.small{font-size:11px;color:var(--muted)}.spinner{display:inline-block;width:14px;height:14px;border:2px solid #ffffff33;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:6px}@keyframes spin{to{transform:rotate(360deg)}}
+    .foot{margin-top:16px;color:var(--muted);font-size:11px;line-height:1.6}.pill{display:inline-block;padding:4px 7px;border-radius:999px;background:#202736;color:#cdd8e8;font-size:11px;margin:2px}@media(min-width:680px){.cards{grid-template-columns:1fr 1fr}.grid{grid-template-columns:repeat(4,1fr)}}
+  </style>
+</head>
+<body><div class="wrap">
+  <div class="head"><div><h1>업비트 풀체크</h1><div class="sub">Upbit Public API 직접 조회 · 캐시 대체 없음 · 데이터 시각 검증</div></div><div class="badge" id="clock">-</div></div>
+  <div class="panel"><div class="row"><button id="scanBtn" onclick="runScan()">KRW 전체 풀체크 · TOP 5</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div id="scanStatus" class="status">버튼을 누르면 KRW 전체를 스캔합니다. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
+  <div class="panel"><div class="row"><input id="market" value="KRW-QUID" placeholder="예: KRW-BTC"/><button class="secondary" onclick="analyzeOne()">종목 분석</button></div><div id="oneStatus" class="status"></div></div>
+  <div id="results" class="cards"></div>
+  <div class="foot">기술 점수는 미래 수익률 예측이 아니라 규칙 기반 스크리닝 점수입니다. 현재가·호가·캔들의 source age가 과도하면 결과에 경고를 표시합니다. 매매 판단은 사용자가 직접 해야 합니다.</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const fmt=n=>{if(n===null||n===undefined||Number.isNaN(Number(n)))return '-';const x=Number(n);return new Intl.NumberFormat('ko-KR',{maximumFractionDigits:x<10?6:x<100?3:0}).format(x)};
+const won=n=>{if(!n)return '-';const x=Number(n);if(x>=1e12)return(x/1e12).toFixed(2)+'조';if(x>=1e8)return(x/1e8).toFixed(1)+'억';if(x>=1e4)return(x/1e4).toFixed(1)+'만';return fmt(x)};
+const pct=n=>n===null||n===undefined?'-':(Number(n)*100).toFixed(2)+'%';
+const age=n=>n===null||n===undefined?'-':(Number(n)<5?Number(n).toFixed(1)+'초':Number(n)<60?Math.round(n)+'초':(Number(n)/60).toFixed(1)+'분');
+function tfSummary(t){if(!t||t.error)return'데이터 부족';return`RSI ${fmt(t.rsi14)} · MACD H ${fmt(t.macd_histogram)} · EMA20${t.ema20_above_ema60?'>':'<'}60 · BB%B ${fmt(t.bollinger_percent_b)} · Vol× ${fmt(t.volume_ratio20)} · age ${age(t.latest_source_age_seconds)}`}
+function card(x,i){const a=x.analysis||x,t=a.ticker||{},m=x.market||a.market||t.market||'-',ch=Number(x.signed_change_rate??t.signed_change_rate??0),cls=ch>=0?'up':'down',ob=a.orderbook_summary||{},tfs=a.timeframes||{};return`<div class="coin"><div class="coinTop"><div><div class="rank">${i?('#'+i):'종목 분석'} · 기술점수 ${fmt(x.technical_screen_score)}</div><div class="market">${m}</div></div><div><div class="price">₩ ${fmt(x.trade_price??t.trade_price)}</div><div class="chg ${cls}">${pct(ch)}</div></div></div><div class="grid"><div class="metric"><div class="k">24H 거래대금</div><div class="v">${won(x.acc_trade_price_24h??t.acc_trade_price_24h)}</div></div><div class="metric"><div class="k">Ticker age</div><div class="v">${age(x.ticker_source_age_seconds??t.source_age_seconds)}</div></div><div class="metric"><div class="k">Best bid / ask</div><div class="v">${fmt(ob.best_bid)} / ${fmt(ob.best_ask)}</div></div><div class="metric"><div class="k">Top10 호가 imbalance</div><div class="v">${ob.top10_imbalance==null?'-':(Number(ob.top10_imbalance)*100).toFixed(1)+'%'}</div></div></div><div class="tf"><div class="tfline"><span class="pill">5m</span> ${tfSummary(tfs['5m'])}</div><div class="tfline"><span class="pill">15m</span> ${tfSummary(tfs['15m'])}</div><div class="tfline"><span class="pill">1h</span> ${tfSummary(tfs['60m'])}</div><div class="tfline"><span class="pill">4h</span> ${tfSummary(tfs['240m'])}</div><div class="tfline"><span class="pill">1d</span> ${tfSummary(tfs['1d'])}</div></div></div>`}
+async function fetchJSON(url,opt){const r=await fetch(url,opt),tx=await r.text();let j;try{j=JSON.parse(tx)}catch(e){throw new Error(`HTTP ${r.status}: ${tx.slice(0,180)}`)}if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j}
+async function checkHealth(){const s=$('scanStatus');s.className='status';s.innerHTML='<span class="spinner"></span>업비트 연결 확인 중...';try{const j=await fetchJSON('/api/health');s.className='status good';s.textContent=`정상 · KRW-BTC ${fmt(j.sample?.trade_price)}원 · 데이터 age ${age(j.source_age_seconds)}`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
+async function runScan(){const b=$('scanBtn'),s=$('scanStatus'),r=$('results');b.disabled=true;s.className='status';s.innerHTML='<span class="spinner"></span>KRW 전체 Ticker → 후보 압축 → 5m/15m/1h/4h/1d + 호가 분석 중...';r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({top_n:5,shortlist_size:10,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('');s.className='status good';s.textContent=`완료 · 전체 ${j.ticker_rows}개 / 조건통과 ${j.eligible_rows}개 / 분석 ${j.shortlist_size}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{b.disabled=false}}
+async function analyzeOne(){const m=$('market').value.trim().toUpperCase(),s=$('oneStatus'),r=$('results');if(!m)return;s.className='status';s.innerHTML='<span class="spinner"></span>'+m+' 분석 중...';try{const j=await fetchJSON('/api/analyze?market='+encodeURIComponent(m));r.innerHTML=card(j,0);s.className='status good';s.textContent='완료 · 공식 Upbit Public API';}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
+setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})},1000);checkHealth();
+</script></body></html>'''
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def mobile_home(request: Request) -> Response:
+    return HTMLResponse(MOBILE_HTML, headers={"Cache-Control": "no-store"})
+
+
+@mcp.custom_route("/api/health", methods=["GET"])
+async def api_health(request: Request) -> Response:
+    try:
+        return JSONResponse(await health_check(), headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=502)
+
+
+@mcp.custom_route("/api/analyze", methods=["GET"])
+async def api_analyze(request: Request) -> Response:
+    market = (request.query_params.get("market") or "").strip().upper()
+    if not market:
+        return JSONResponse({"error": "market is required, e.g. KRW-BTC"}, status_code=400)
+    try:
+        return JSONResponse(await _analyze_market_full(market), headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=502)
+
+
+@mcp.custom_route("/api/tickers", methods=["GET"])
+async def api_tickers(request: Request) -> Response:
+    quote = (request.query_params.get("quote") or "KRW").strip().upper()
+    try:
+        return JSONResponse(await get_all_tickers(quote), headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=502)
+
+
+@mcp.custom_route("/api/scan", methods=["POST"])
+async def api_scan(request: Request) -> Response:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        data = await scan_krw_market(
+            top_n=int(body.get("top_n", 5)),
+            shortlist_size=int(body.get("shortlist_size", 10)),
+            min_turnover_krw=float(body.get("min_turnover_krw", 1_000_000_000)),
+        )
+        return JSONResponse(data, headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=502)
 
 
 if __name__ == "__main__":
