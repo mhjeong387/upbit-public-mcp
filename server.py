@@ -16,7 +16,7 @@ BASE_URL = "https://api.upbit.com"
 TIMEOUT = httpx.Timeout(15.0, connect=8.0)
 HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "UpbitPublicMCP/1.0",
+    "User-Agent": "UpbitPublicMCP/3.0",
 }
 
 mcp = MCPServer("Upbit Public Market Data")
@@ -339,6 +339,46 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         if up != lo:
             bb_pctb = (close[last] - lo) / (up - lo)
 
+    def _ret_bars(n: int) -> float | None:
+        if last - n < 0 or close[last - n] == 0:
+            return None
+        return (close[last] / close[last - n] - 1.0) * 100.0
+
+    def _recent_window_stats(n: int) -> dict[str, float | int | None]:
+        start = max(0, last - n + 1)
+        window = candles[start:last + 1]
+        if not window:
+            return {"high": None, "low": None, "runup_from_low_pct": None, "drawdown_from_high_pct": None, "max_bar_gain_pct": None, "upper_wick_ratio": None, "up_bars": 0}
+        highs = [float(c["high_price"]) for c in window]
+        lows = [float(c["low_price"]) for c in window]
+        hi, lo = max(highs), min(lows)
+        gains = []
+        upper_wicks = []
+        up_bars = 0
+        for c in window:
+            o = float(c.get("opening_price", 0) or 0)
+            h = float(c.get("high_price", 0) or 0)
+            l = float(c.get("low_price", 0) or 0)
+            cl = float(c.get("trade_price", 0) or 0)
+            if o:
+                gains.append((cl / o - 1.0) * 100.0)
+            if cl > o:
+                up_bars += 1
+            rng = h - l
+            if rng > 0:
+                upper_wicks.append(max(0.0, h - max(o, cl)) / rng)
+        return {
+            "high": hi,
+            "low": lo,
+            "runup_from_low_pct": ((close[last] / lo - 1.0) * 100.0) if lo else None,
+            "drawdown_from_high_pct": ((close[last] / hi - 1.0) * 100.0) if hi else None,
+            "max_bar_gain_pct": max(gains) if gains else None,
+            "upper_wick_ratio": _mean(upper_wicks),
+            "up_bars": up_bars,
+        }
+
+    recent7 = _recent_window_stats(7)
+    recent14 = _recent_window_stats(14)
     latest = raw[0]
     return {
         "timeframe": timeframe,
@@ -373,6 +413,13 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         "quote_volume_sma20": q20,
         "recent_high_20": max(float(c["high_price"]) for c in candles[max(0, last - 19): last + 1]),
         "recent_low_20": min(float(c["low_price"]) for c in candles[max(0, last - 19): last + 1]),
+        "return_1bar_pct": _ret_bars(1),
+        "return_3bar_pct": _ret_bars(3),
+        "return_5bar_pct": _ret_bars(5),
+        "return_7bar_pct": _ret_bars(7),
+        "return_14bar_pct": _ret_bars(14),
+        "recent7": recent7,
+        "recent14": recent14,
         "remaining_req": headers.get("remaining-req"),
     }
 
@@ -481,10 +528,134 @@ def _ratio_quality(ratio: float | None) -> float:
     return 0.05
 
 
+def _surge_drive_profile(analysis: dict[str, Any], ticker_row: dict[str, Any]) -> dict[str, Any]:
+    """Assess recent surge/retrace risk and classify momentum 'drive' style. Not a probability model."""
+    tfs = analysis.get("timeframes", {}) if isinstance(analysis, dict) else {}
+    ob = analysis.get("orderbook_summary", {}) if isinstance(analysis, dict) else {}
+
+    def tf(name: str) -> dict[str, Any]:
+        x = tfs.get(name, {})
+        return x if isinstance(x, dict) and not x.get("error") else {}
+
+    d = tf("1d")
+    h4 = tf("240m")
+    h1 = tf("60m")
+    m15 = tf("15m")
+    m5 = tf("5m")
+    change24 = float(ticker_row.get("signed_change_rate", 0) or 0) * 100.0
+    r3 = float(d.get("return_3bar_pct") or 0.0)
+    r5 = float(d.get("return_5bar_pct") or 0.0)
+    r7 = float(d.get("return_7bar_pct") or 0.0)
+    r14 = float(d.get("return_14bar_pct") or 0.0)
+    rec7 = d.get("recent7") or {}
+    runup7 = float(rec7.get("runup_from_low_pct") or 0.0)
+    dd7 = float(rec7.get("drawdown_from_high_pct") or 0.0)
+    max_day_gain7 = float(rec7.get("max_bar_gain_pct") or 0.0)
+    upper_wick = float(rec7.get("upper_wick_ratio") or 0.0)
+    dvol = float(d.get("volume_ratio20") or 0.0)
+    imbalance = ob.get("top10_imbalance")
+    imbalance = float(imbalance) if imbalance is not None else 0.0
+
+    # Surge intensity 0-100: combines multi-day return, run-up and single-day impulse.
+    surge = 0.0
+    surge += _clamp(max(r3, 0.0) / 15.0, 0.0, 1.0) * 24.0
+    surge += _clamp(max(r5, 0.0) / 24.0, 0.0, 1.0) * 24.0
+    surge += _clamp(max(r7, 0.0) / 32.0, 0.0, 1.0) * 18.0
+    surge += _clamp(max(runup7, 0.0) / 35.0, 0.0, 1.0) * 18.0
+    surge += _clamp(max(max_day_gain7, 0.0) / 16.0, 0.0, 1.0) * 10.0
+    surge += _clamp(max(change24, 0.0) / 15.0, 0.0, 1.0) * 6.0
+    surge = _clamp(surge, 0.0, 100.0)
+
+    risk = 0.0
+    # Recent multi-day verticality.
+    risk += _clamp((r3 - 10.0) / 15.0, 0.0, 1.0) * 14.0
+    risk += _clamp((r5 - 18.0) / 22.0, 0.0, 1.0) * 16.0
+    risk += _clamp((runup7 - 22.0) / 28.0, 0.0, 1.0) * 12.0
+    risk += _clamp((max_day_gain7 - 10.0) / 15.0, 0.0, 1.0) * 8.0
+
+    # Overbought/extension.
+    d_rsi = float(d.get("rsi14") or 0.0)
+    h4_rsi = float(h4.get("rsi14") or 0.0)
+    h1_rsi = float(h1.get("rsi14") or 0.0)
+    d_b = float(d.get("bollinger_percent_b") or 0.0)
+    h4_b = float(h4.get("bollinger_percent_b") or 0.0)
+    risk += _clamp((d_rsi - 68.0) / 14.0, 0.0, 1.0) * 12.0
+    risk += _clamp((h4_rsi - 72.0) / 16.0, 0.0, 1.0) * 10.0
+    risk += _clamp((h1_rsi - 78.0) / 14.0, 0.0, 1.0) * 7.0
+    risk += _clamp((d_b - 0.98) / 0.38, 0.0, 1.0) * 8.0
+    risk += _clamp((h4_b - 1.02) / 0.38, 0.0, 1.0) * 8.0
+
+    # Blow-off/distribution hints: oversized volume, upper wicks, selling orderbook, momentum rollover.
+    if dvol > 4.0:
+        risk += _clamp((dvol - 4.0) / 8.0, 0.0, 1.0) * 5.0
+    if upper_wick > 0.28:
+        risk += _clamp((upper_wick - 0.28) / 0.35, 0.0, 1.0) * 4.0
+    if imbalance < -0.20:
+        risk += _clamp((-imbalance - 0.20) / 0.45, 0.0, 1.0) * 6.0
+    h1_delta = h1.get("macd_histogram_delta")
+    h4_delta = h4.get("macd_histogram_delta")
+    if surge >= 45 and h1_delta is not None and float(h1_delta) < 0:
+        risk += 4.0
+    if surge >= 45 and h4_delta is not None and float(h4_delta) < 0:
+        risk += 4.0
+    risk = _clamp(risk, 0.0, 100.0)
+
+    aligned = sum(1 for x in (h1, h4, d) if x.get("ema20_above_ema60"))
+    short_recover = 0
+    for x in (m5, m15):
+        delta = x.get("macd_histogram_delta")
+        rsi = x.get("rsi14")
+        if delta is not None and float(delta) > 0 and rsi is not None and 35 <= float(rsi) <= 58:
+            short_recover += 1
+    mid_positive = sum(1 for x in (h1, h4, d) if (x.get("macd_histogram") is not None and float(x.get("macd_histogram")) > 0))
+
+    if surge >= 60 and risk >= 65:
+        drive = "과열 급등형"
+    elif surge >= 45 and dd7 <= -5.0 and ((h1_delta is not None and float(h1_delta) < 0) or imbalance < -0.20):
+        drive = "분배·되돌림형"
+    elif surge >= 35 and -16.0 <= dd7 <= -3.0 and short_recover >= 1 and aligned >= 2:
+        drive = "눌림 후 재가속형"
+    elif aligned == 3 and mid_positive >= 2 and risk < 55:
+        drive = "추세 지속형"
+    elif aligned >= 2 and surge < 40 and risk < 45:
+        drive = "초기 드라이브형"
+    else:
+        drive = "혼합·중립형"
+
+    if drive == "눌림 후 재가속형":
+        bonus = 4.0
+    elif drive == "초기 드라이브형":
+        bonus = 3.0
+    elif drive == "추세 지속형":
+        bonus = 2.0
+    elif drive == "분배·되돌림형":
+        bonus = -2.0
+    elif drive == "과열 급등형":
+        bonus = -4.0
+    else:
+        bonus = 0.0
+
+    return {
+        "surge_intensity": round(surge, 1),
+        "surge_risk": round(risk, 1),
+        "drive_profile": drive,
+        "drive_bonus": bonus,
+        "recent_return_3d_pct": round(r3, 2),
+        "recent_return_5d_pct": round(r5, 2),
+        "recent_return_7d_pct": round(r7, 2),
+        "recent_return_14d_pct": round(r14, 2),
+        "runup_7d_pct": round(runup7, 2),
+        "drawdown_from_7d_high_pct": round(dd7, 2),
+        "max_daily_gain_7d_pct": round(max_day_gain7, 2),
+        "upper_wick_ratio_7d": round(upper_wick, 3),
+    }
+
+
 def _score_market(analysis: dict[str, Any], ticker_row: dict[str, Any], mode: str = "swing5d") -> dict[str, Any]:
     """Return transparent rule-based score components. Scores are not probabilities."""
     tfs = analysis.get("timeframes", {}) if isinstance(analysis, dict) else {}
     ob = analysis.get("orderbook_summary", {}) if isinstance(analysis, dict) else {}
+    surge_profile = _surge_drive_profile(analysis, ticker_row)
     change_pct = float(ticker_row.get("signed_change_rate", 0) or 0) * 100.0
     turnover = float(ticker_row.get("acc_trade_price_24h", 0) or 0)
     ticker_age = ticker_row.get("source_age_seconds")
@@ -601,18 +772,33 @@ def _score_market(analysis: dict[str, Any], ticker_row: dict[str, Any], mode: st
         if pullback and aligned >= 2:
             tags.append("중기상승·단기눌림")
 
-        if change_pct > 10:
-            heat_penalty += min(8.0, (change_pct - 10.0) * 0.65)
+        # Stronger anti-chasing rules for a 5-day entry horizon.
+        if change_pct > 8:
+            heat_penalty += min(10.0, (change_pct - 8.0) * 0.85)
+        if change_pct > 12:
+            heat_penalty += min(4.0, (change_pct - 12.0) * 0.45)
         if change_pct < -8:
             heat_penalty += min(4.0, abs(change_pct + 8.0) * 0.35)
-        for name, rsi_cut, bb_cut, mult in [("240m", 72.0, 1.00, 1.0), ("1d", 72.0, 1.00, 1.2)]:
+        for name, rsi_cut, bb_cut, mult in [("60m", 78.0, 1.12, 0.8), ("240m", 70.0, 1.00, 1.25), ("1d", 70.0, 0.98, 1.45)]:
             x = tf(name)
             rsi, pctb = x.get("rsi14"), x.get("bollinger_percent_b")
             if rsi is not None and rsi > rsi_cut:
-                heat_penalty += min(6.0, (rsi - rsi_cut) * 0.65 * mult)
+                heat_penalty += min(8.0, (rsi - rsi_cut) * 0.80 * mult)
             if pctb is not None and pctb > bb_cut:
-                heat_penalty += min(5.0, (pctb - bb_cut) * 12.0 * mult)
-        if heat_penalty >= 7.0:
+                heat_penalty += min(7.0, (pctb - bb_cut) * 15.0 * mult)
+
+        # Recent pump risk: catches coins that surged over several days even if today's change is modest.
+        surge_risk = float(surge_profile.get("surge_risk", 0.0) or 0.0)
+        surge_penalty = _clamp((surge_risk - 28.0) * 0.18, 0.0, 13.0)
+        heat_penalty += surge_penalty
+        if surge_risk >= 65:
+            tags.append("최근급등 고위험")
+        elif surge_risk >= 48:
+            tags.append("최근급등 주의")
+        drive = str(surge_profile.get("drive_profile") or "")
+        if drive:
+            tags.append(drive)
+        if heat_penalty >= 8.0:
             tags.append("과열주의")
 
         trend_score = _clamp(trend_raw, 0.0, 40.0)
@@ -644,7 +830,8 @@ def _score_market(analysis: dict[str, Any], ticker_row: dict[str, Any], mode: st
     if candle_ages and max(candle_ages) > 120:
         freshness_penalty += min(8.0, (max(candle_ages) - 120.0) / 60.0)
 
-    total = trend_score + volume_score + entry_score + orderbook_score + liquidity_score - heat_penalty - freshness_penalty
+    drive_bonus = float(surge_profile.get("drive_bonus", 0.0) or 0.0) if mode == "swing5d" else 0.0
+    total = trend_score + volume_score + entry_score + orderbook_score + liquidity_score + drive_bonus - heat_penalty - freshness_penalty
     total = _clamp(total, 0.0, 100.0)
 
     return {
@@ -658,7 +845,12 @@ def _score_market(analysis: dict[str, Any], ticker_row: dict[str, Any], mode: st
         "liquidity_score": round(liquidity_score, 3),
         "heat_penalty": round(heat_penalty, 3),
         "freshness_penalty": round(freshness_penalty, 3),
-        "tags": tags[:5],
+        "surge_intensity": surge_profile.get("surge_intensity"),
+        "surge_risk": surge_profile.get("surge_risk"),
+        "drive_profile": surge_profile.get("drive_profile"),
+        "drive_bonus": round(drive_bonus, 3),
+        "recent_surge": surge_profile,
+        "tags": tags[:7],
     }
 
 
@@ -669,12 +861,12 @@ async def scan_krw_market(
     min_turnover_krw: float = 1_000_000_000,
     mode: str = "swing5d",
 ) -> dict[str, Any]:
-    """KRW market scanner. mode='day' emphasizes 5m/15m/1h; mode='swing5d' emphasizes 1h/4h/1d and penalizes overheat."""
+    """KRW market scanner. mode='day' emphasizes 5m/15m/1h; mode='swing5d' emphasizes 1h/4h/1d, recent multi-day surge risk, and momentum drive profile."""
     mode = (mode or "swing5d").strip().lower()
     if mode not in {"day", "swing5d"}:
         raise ValueError("mode must be 'day' or 'swing5d'")
     top_n = max(1, min(int(top_n), 10))
-    shortlist_size = max(top_n, min(int(shortlist_size), 20))
+    shortlist_size = max(top_n, min(int(shortlist_size), 24))
     tickers, headers = await _get("/v1/ticker/all", {"quote_currencies": "KRW"})
 
     fresh_rows: list[dict[str, Any]] = []
@@ -717,7 +909,7 @@ async def scan_krw_market(
         "received_at_utc": _utc_now_iso(),
         "mode": mode,
         "mode_label": "오늘 단타" if mode == "day" else "5일 스윙",
-        "method": "KRW /ticker/all -> shortlist -> 5m/15m/1h/4h/1d + orderbook with mode-specific scoring",
+        "method": "KRW /ticker/all -> shortlist -> 5m/15m/1h/4h/1d + orderbook + recent-surge risk/drive profile",
         "important": "Scores are deterministic screening scores, not probabilities or promises of future gains.",
         "ticker_rows": len(tickers),
         "eligible_rows": len(fresh_rows),
@@ -736,7 +928,7 @@ MOBILE_HTML = r'''<!doctype html>
   <meta name="theme-color" content="#0b0d12" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>Upbit Full Check v2</title>
+  <title>Upbit Full Check v3</title>
   <style>
     :root{--bg:#0b0d12;--card:#151923;--line:#262c3a;--txt:#f4f7fb;--muted:#9ba7ba;--accent:#5da8ff;--swing:#73e2a7;--good:#35d07f;--bad:#ff6472;--warn:#ffbf5f}
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}
@@ -756,11 +948,11 @@ MOBILE_HTML = r'''<!doctype html>
   </style>
 </head>
 <body><div class="wrap">
-  <div class="head"><div><h1>업비트 풀체크 v2</h1><div class="sub">Upbit Public API 직접 조회 · 캐시 대체 없음 · 단타/5일 스윙 분리</div></div><div class="badge" id="clock">-</div></div>
-  <div class="panel"><div class="row"><button id="dayBtn" onclick="runScan('day')">오늘 단타 TOP 5</button><button id="swingBtn" class="swing" onclick="runScan('swing5d')">5일 스윙 TOP 5</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div class="modehint">단타는 5m·15m·1h와 호가/거래량 비중이 큽니다. 5일 스윙은 1h·4h·1d를 중심으로 보고 RSI·볼린저·당일 급등 과열을 별도 감점합니다.</div><div id="scanStatus" class="status">원하는 모드를 누르세요. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
+  <div class="head"><div><h1>업비트 풀체크 v3</h1><div class="sub">Upbit Public API 직접 조회 · 캐시 대체 없음 · 급등 리스크/드라이브 성향 추가</div></div><div class="badge" id="clock">-</div></div>
+  <div class="panel"><div class="row"><button id="dayBtn" onclick="runScan('day')">오늘 단타 TOP 5</button><button id="swingBtn" class="swing" onclick="runScan('swing5d')">5일 스윙 TOP 5</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div class="modehint">단타는 5m·15m·1h와 호가/거래량 비중이 큽니다. 5일 스윙은 1h·4h·1d를 중심으로 보고 3·5·7일 급등 이력, RSI·볼린저 확장, 호가·모멘텀 롤오버를 합쳐 급등 리스크와 드라이브 성향을 별도 평가합니다.</div><div id="scanStatus" class="status">원하는 모드를 누르세요. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
   <div class="panel"><div class="row"><input id="market" value="KRW-QUID" placeholder="예: KRW-BTC"/><button class="secondary" onclick="analyzeOne()">현재 모드로 종목 분석</button></div><div id="oneStatus" class="status"></div></div>
   <div id="results" class="cards"></div>
-  <div class="foot">점수는 미래 수익률 확률이 아니라 규칙 기반 스크리닝 점수입니다. 과열 감점과 데이터 신선도 감점을 분리해 표시합니다. 현재가·호가·캔들 source age가 오래되면 감점됩니다.</div>
+  <div class="foot">점수는 미래 수익률 확률이 아니라 규칙 기반 스크리닝 점수입니다. 최근 급등 리스크와 드라이브 성향은 3·5·7일 수익률, 7일 런업/고점대비 조정, RSI·볼린저·거래량·호가·MACD 변화로 계산합니다. 현재가·호가·캔들 source age가 오래되면 감점됩니다.</div>
 </div>
 <script>
 const $=id=>document.getElementById(id);let currentMode='swing5d';
@@ -769,12 +961,12 @@ const won=n=>{if(!n)return '-';const x=Number(n);if(x>=1e12)return(x/1e12).toFix
 const pct=n=>n===null||n===undefined?'-':(Number(n)*100).toFixed(2)+'%';
 const age=n=>n===null||n===undefined?'-':(Number(n)<5?Number(n).toFixed(1)+'초':Number(n)<60?Math.round(n)+'초':(Number(n)/60).toFixed(1)+'분');
 function tfSummary(t){if(!t||t.error)return'데이터 부족';const d=t.macd_histogram_delta;return`RSI ${fmt(t.rsi14)} · MACD H ${fmt(t.macd_histogram)}${d==null?'':(' Δ'+fmt(d))} · EMA20${t.ema20_above_ema60?'>':'<'}60 · BB%B ${fmt(t.bollinger_percent_b)} · Vol× ${fmt(t.volume_ratio20)} · age ${age(t.latest_source_age_seconds)}`}
-function scoreGrid(b){if(!b)return'';return`<div class="scores"><div class="score"><div class="k">추세</div><div class="v">${fmt(b.trend_score)}</div></div><div class="score"><div class="k">거래량</div><div class="v">${fmt(b.volume_score)}</div></div><div class="score"><div class="k">진입</div><div class="v">${fmt(b.entry_score)}</div></div><div class="score"><div class="k">호가</div><div class="v">${fmt(b.orderbook_score)}</div></div><div class="score"><div class="k">유동성</div><div class="v">${fmt(b.liquidity_score)}</div></div><div class="score pen"><div class="k">과열 감점</div><div class="v">-${fmt(b.heat_penalty)}</div></div></div>`}
+function scoreGrid(b){if(!b)return'';return`<div class="scores"><div class="score"><div class="k">추세</div><div class="v">${fmt(b.trend_score)}</div></div><div class="score"><div class="k">거래량</div><div class="v">${fmt(b.volume_score)}</div></div><div class="score"><div class="k">진입</div><div class="v">${fmt(b.entry_score)}</div></div><div class="score"><div class="k">호가</div><div class="v">${fmt(b.orderbook_score)}</div></div><div class="score"><div class="k">유동성</div><div class="v">${fmt(b.liquidity_score)}</div></div><div class="score pen"><div class="k">과열 감점</div><div class="v">-${fmt(b.heat_penalty)}</div></div><div class="score pen"><div class="k">최근급등 리스크</div><div class="v">${fmt(b.surge_risk)}/100</div></div><div class="score"><div class="k">드라이브 성향</div><div class="v">${b.drive_profile||'-'}</div></div><div class="score"><div class="k">드라이브 보정</div><div class="v">${Number(b.drive_bonus||0)>=0?'+':''}${fmt(b.drive_bonus)}</div></div></div>`}
 function tagHtml(tags){return(tags||[]).length?`<div class="tags">${tags.map(t=>`<span class="tag ${t.includes('주의')||t.includes('매도')?'warn':''}">${t}</span>`).join('')}</div>`:''}
-function card(x,i){const a=x.analysis||x,t=a.ticker||{},m=x.market||a.market||t.market||'-',ch=Number(x.signed_change_rate??t.signed_change_rate??0),cls=ch>=0?'up':'down',ob=a.orderbook_summary||{},tfs=a.timeframes||{},b=x.score_breakdown||x.score||{},label=b.mode_label||'종목 분석',total=b.total_score??x.technical_screen_score;return`<div class="coin"><div class="coinTop"><div><div class="rank">${i?('#'+i):'종목 분석'} · ${label} ${fmt(total)}점</div><div class="market">${m}</div></div><div><div class="price">₩ ${fmt(x.trade_price??t.trade_price)}</div><div class="chg ${cls}">${pct(ch)}</div></div></div>${tagHtml(b.tags)}${scoreGrid(b)}<div class="grid"><div class="metric"><div class="k">24H 거래대금</div><div class="v">${won(x.acc_trade_price_24h??t.acc_trade_price_24h)}</div></div><div class="metric"><div class="k">Ticker age</div><div class="v">${age(x.ticker_source_age_seconds??t.source_age_seconds)}</div></div><div class="metric"><div class="k">Best bid / ask</div><div class="v">${fmt(ob.best_bid)} / ${fmt(ob.best_ask)}</div></div><div class="metric"><div class="k">Top10 호가 imbalance</div><div class="v">${ob.top10_imbalance==null?'-':(Number(ob.top10_imbalance)*100).toFixed(1)+'%'}</div></div></div><div class="tf"><div class="tfline"><span class="pill">5m</span> ${tfSummary(tfs['5m'])}</div><div class="tfline"><span class="pill">15m</span> ${tfSummary(tfs['15m'])}</div><div class="tfline"><span class="pill">1h</span> ${tfSummary(tfs['60m'])}</div><div class="tfline"><span class="pill">4h</span> ${tfSummary(tfs['240m'])}</div><div class="tfline"><span class="pill">1d</span> ${tfSummary(tfs['1d'])}</div></div></div>`}
+function card(x,i){const a=x.analysis||x,t=a.ticker||{},m=x.market||a.market||t.market||'-',ch=Number(x.signed_change_rate??t.signed_change_rate??0),cls=ch>=0?'up':'down',ob=a.orderbook_summary||{},tfs=a.timeframes||{},b=x.score_breakdown||x.score||{},label=b.mode_label||'종목 분석',total=b.total_score??x.technical_screen_score;return`<div class="coin"><div class="coinTop"><div><div class="rank">${i?('#'+i):'종목 분석'} · ${label} ${fmt(total)}점</div><div class="market">${m}</div></div><div><div class="price">₩ ${fmt(x.trade_price??t.trade_price)}</div><div class="chg ${cls}">${pct(ch)}</div></div></div>${tagHtml(b.tags)}${scoreGrid(b)}<div class="grid"><div class="metric"><div class="k">24H 거래대금</div><div class="v">${won(x.acc_trade_price_24h??t.acc_trade_price_24h)}</div></div><div class="metric"><div class="k">Ticker age</div><div class="v">${age(x.ticker_source_age_seconds??t.source_age_seconds)}</div></div><div class="metric"><div class="k">Best bid / ask</div><div class="v">${fmt(ob.best_bid)} / ${fmt(ob.best_ask)}</div></div><div class="metric"><div class="k">Top10 호가 imbalance</div><div class="v">${ob.top10_imbalance==null?'-':(Number(ob.top10_imbalance)*100).toFixed(1)+'%'}</div></div></div>${b.recent_surge?`<div class="tf"><div class="tfline"><span class="pill">최근급등</span> 3D ${fmt(b.recent_surge.recent_return_3d_pct)}% · 5D ${fmt(b.recent_surge.recent_return_5d_pct)}% · 7D ${fmt(b.recent_surge.recent_return_7d_pct)}% · 7D저점대비 ${fmt(b.recent_surge.runup_7d_pct)}% · 7D고점대비 ${fmt(b.recent_surge.drawdown_from_7d_high_pct)}%</div></div>`:''}<div class="tf"><div class="tfline"><span class="pill">5m</span> ${tfSummary(tfs['5m'])}</div><div class="tfline"><span class="pill">15m</span> ${tfSummary(tfs['15m'])}</div><div class="tfline"><span class="pill">1h</span> ${tfSummary(tfs['60m'])}</div><div class="tfline"><span class="pill">4h</span> ${tfSummary(tfs['240m'])}</div><div class="tfline"><span class="pill">1d</span> ${tfSummary(tfs['1d'])}</div></div></div>`}
 async function fetchJSON(url,opt){const r=await fetch(url,opt),tx=await r.text();let j;try{j=JSON.parse(tx)}catch(e){throw new Error(`HTTP ${r.status}: ${tx.slice(0,180)}`)}if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j}
 async function checkHealth(){const s=$('scanStatus');s.className='status';s.innerHTML='<span class="spinner"></span>업비트 연결 확인 중...';try{const j=await fetchJSON('/api/health');s.className='status good';s.textContent=`정상 · KRW-BTC ${fmt(j.sample?.trade_price)}원 · 데이터 age ${age(j.source_age_seconds)}`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
-async function runScan(mode){currentMode=mode;const db=$('dayBtn'),sb=$('swingBtn'),s=$('scanStatus'),r=$('results');db.disabled=true;sb.disabled=true;s.className='status';const isSwing=mode==='swing5d';s.innerHTML=`<span class="spinner"></span>${isSwing?'5일 스윙':'오늘 단타'}: KRW 전체 Ticker → 후보 압축 → 5m/15m/1h/4h/1d + 호가 분석 중...`;r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,top_n:5,shortlist_size:isSwing?14:10,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('');s.className='status good';s.textContent=`${j.mode_label} 완료 · 전체 ${j.ticker_rows}개 / 조건통과 ${j.eligible_rows}개 / 정밀분석 ${j.shortlist_size}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{db.disabled=false;sb.disabled=false}}
+async function runScan(mode){currentMode=mode;const db=$('dayBtn'),sb=$('swingBtn'),s=$('scanStatus'),r=$('results');db.disabled=true;sb.disabled=true;s.className='status';const isSwing=mode==='swing5d';s.innerHTML=`<span class="spinner"></span>${isSwing?'5일 스윙':'오늘 단타'}: KRW 전체 Ticker → 후보 압축 → 5m/15m/1h/4h/1d + 호가 분석 중...`;r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,top_n:5,shortlist_size:isSwing?18:10,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('');s.className='status good';s.textContent=`${j.mode_label} 완료 · 전체 ${j.ticker_rows}개 / 조건통과 ${j.eligible_rows}개 / 정밀분석 ${j.shortlist_size}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{db.disabled=false;sb.disabled=false}}
 async function analyzeOne(){const m=$('market').value.trim().toUpperCase(),s=$('oneStatus'),r=$('results');if(!m)return;s.className='status';s.innerHTML='<span class="spinner"></span>'+m+' 분석 중...';try{const j=await fetchJSON('/api/analyze?market='+encodeURIComponent(m)+'&mode='+encodeURIComponent(currentMode));r.innerHTML=card(j,0);s.className='status good';s.textContent='완료 · '+(j.score_breakdown?.mode_label||'공식 Upbit Public API');}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
 setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})},1000);checkHealth();
 </script></body></html>'''
