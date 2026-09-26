@@ -329,6 +329,7 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
     v20 = _mean(volumes[max(0, last - 19) : last + 1])
     q20 = _mean(quote_values[max(0, last - 19) : last + 1])
     bb_width = None
+    bb_width_prev = None
     bb_pctb = None
     if bb["upper"][last] is not None and bb["lower"][last] is not None and bb["middle"][last] is not None:
         up = float(bb["upper"][last])
@@ -338,6 +339,8 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
             bb_width = (up - lo) / mid
         if up != lo:
             bb_pctb = (close[last] - lo) / (up - lo)
+    if last > 0 and bb["middle"][last - 1]:
+        bb_width_prev = (bb["upper"][last - 1] - bb["lower"][last - 1]) / bb["middle"][last - 1]
 
     def _ret_bars(n: int) -> float | None:
         if last - n < 0 or close[last - n] == 0:
@@ -386,6 +389,7 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         "latest_candle_kst": latest.get("candle_date_time_kst"),
         "latest_source_age_seconds": _ms_age_seconds(latest.get("timestamp")),
         "close": close[last],
+        "open": float(latest["opening_price"]),
         "rsi14": rsi14[last],
         "ema20": ema20[last],
         "ema60": ema60[last],
@@ -404,6 +408,7 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         "bollinger_lower": bb["lower"][last],
         "bollinger_percent_b": bb_pctb,
         "bollinger_width": bb_width,
+        "bollinger_width_prev": bb_width_prev,
         "atr14": atr14[last],
         "atr14_pct": (atr14[last] / close[last]) if atr14[last] is not None and close[last] else None,
         "volume": volumes[last],
@@ -920,6 +925,78 @@ async def scan_krw_market(
     }
 
 
+def _matches_macd_expansion(t: dict[str, Any], rising_15m: bool = False) -> bool:
+    """Golden state means MACD strictly above signal, including an unfinished candle."""
+    if t.get("error") or t.get("macd") is None or t.get("macd_signal") is None:
+        return False
+    if t["macd"] <= t["macd_signal"]:
+        return False
+    if rising_15m:
+        return (t.get("close") is not None and t.get("open") is not None
+                and t["close"] > t["open"]
+                and t.get("bollinger_width") is not None
+                and t.get("bollinger_width_prev") is not None
+                and t["bollinger_width"] > t["bollinger_width_prev"])
+    return True
+
+
+@mcp.tool()
+async def scan_macd_bb_expansion() -> dict[str, Any]:
+    """Check every KRW pair: golden MACD state on 15m/1h/4h/day, rising 15m candle and widening 15m Bollinger width."""
+    tickers, _ = await _get("/v1/ticker/all", {"quote_currencies": "KRW"})
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    limiter = asyncio.Lock()
+    next_request = 0.0
+
+    async def paced_tf(market: str, tf: str) -> dict[str, Any]:
+        nonlocal next_request
+        async with limiter:
+            now = time.monotonic()
+            await asyncio.sleep(max(0.0, next_request - now))
+            next_request = time.monotonic() + 0.13
+        return await _analyze_tf(market, tf)
+
+    async def check(row: dict[str, Any]) -> None:
+        market = row["market"]
+        try:
+            tfs = {"15m": await paced_tf(market, "15m")}
+            if not _matches_macd_expansion(tfs["15m"], rising_15m=True):
+                return
+            for tf in ("60m", "240m", "1d"):
+                tfs[tf] = await paced_tf(market, tf)
+                if not _matches_macd_expansion(tfs[tf]):
+                    return
+            results.append({
+                "market": market, "trade_price": row.get("trade_price"),
+                "signed_change_rate": row.get("signed_change_rate"),
+                "ticker_source_age_seconds": _ms_age_seconds(row.get("timestamp")),
+                "timeframes": {tf: {
+                    "macd": tfs[tf]["macd"], "signal": tfs[tf]["macd_signal"],
+                    "candle_kst": tfs[tf]["latest_candle_kst"],
+                    "bb_width": tfs[tf]["bollinger_width"] if tf == "15m" else None,
+                    "bb_width_prev": tfs[tf]["bollinger_width_prev"] if tf == "15m" else None,
+                } for tf in ("15m", "60m", "240m", "1d")},
+            })
+        except Exception as exc:
+            errors.append({"market": market, "error": f"{type(exc).__name__}: {exc}"})
+
+    semaphore = asyncio.Semaphore(3)
+
+    async def bounded(row: dict[str, Any]) -> None:
+        async with semaphore:
+            await check(row)
+
+    await asyncio.gather(*(bounded(row) for row in tickers))
+    results.sort(key=lambda x: float(x.get("signed_change_rate") or 0), reverse=True)
+    return {
+        "received_at_utc": _utc_now_iso(), "ticker_rows": len(tickers),
+        "checked_rows": len(tickers) - len(errors), "errors": errors,
+        "match_count": len(results), "matches": results,
+        "criteria": "MACD > signal on 15m/1h/4h/day; current 15m close > open; normalized BB width > preceding 15m width",
+    }
+
+
 MOBILE_HTML = r'''<!doctype html>
 <html lang="ko">
 <head>
@@ -949,7 +1026,7 @@ MOBILE_HTML = r'''<!doctype html>
 </head>
 <body><div class="wrap">
   <div class="head"><div><h1>업비트 풀체크 v3</h1><div class="sub">Upbit Public API 직접 조회 · 캐시 대체 없음 · 급등 리스크/드라이브 성향 추가</div></div><div class="badge" id="clock">-</div></div>
-  <div class="panel"><div class="row"><button id="dayBtn" onclick="runScan('day')">오늘 단타 TOP 5</button><button id="swingBtn" class="swing" onclick="runScan('swing5d')">5일 스윙 TOP 5</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div class="modehint">단타는 5m·15m·1h와 호가/거래량 비중이 큽니다. 5일 스윙은 1h·4h·1d를 중심으로 보고 3·5·7일 급등 이력, RSI·볼린저 확장, 호가·모멘텀 롤오버를 합쳐 급등 리스크와 드라이브 성향을 별도 평가합니다.</div><div id="scanStatus" class="status">원하는 모드를 누르세요. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
+  <div class="panel"><div class="row"><button id="dayBtn" onclick="runScan('day')">오늘 단타 TOP 5</button><button id="swingBtn" class="swing" onclick="runScan('swing5d')">5일 스윙 TOP 5</button><button id="macdBtn" onclick="runMacdScan()">4개 봉 MACD + 15분 볼밴 확장</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div class="modehint">새 버튼: 원화마켓 전체에서 현재 진행 중인 15분·1시간·4시간·1일봉 MACD가 시그널 위에 있고, 15분봉 종가가 시가보다 높으며 15분 볼밴 폭이 직전 봉보다 큰 종목을 전부 표시합니다. 전체 조회에는 시간이 걸릴 수 있습니다.</div><div id="scanStatus" class="status">원하는 모드를 누르세요. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
   <div class="panel"><div class="row"><input id="market" value="KRW-QUID" placeholder="예: KRW-BTC"/><button class="secondary" onclick="analyzeOne()">현재 모드로 종목 분석</button></div><div id="oneStatus" class="status"></div></div>
   <div id="results" class="cards"></div>
   <div class="foot">점수는 미래 수익률 확률이 아니라 규칙 기반 스크리닝 점수입니다. 최근 급등 리스크와 드라이브 성향은 3·5·7일 수익률, 7일 런업/고점대비 조정, RSI·볼린저·거래량·호가·MACD 변화로 계산합니다. 현재가·호가·캔들 source age가 오래되면 감점됩니다.</div>
@@ -967,6 +1044,7 @@ function card(x,i){const a=x.analysis||x,t=a.ticker||{},m=x.market||a.market||t.
 async function fetchJSON(url,opt){const r=await fetch(url,opt),tx=await r.text();let j;try{j=JSON.parse(tx)}catch(e){throw new Error(`HTTP ${r.status}: ${tx.slice(0,180)}`)}if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j}
 async function checkHealth(){const s=$('scanStatus');s.className='status';s.innerHTML='<span class="spinner"></span>업비트 연결 확인 중...';try{const j=await fetchJSON('/api/health');s.className='status good';s.textContent=`정상 · KRW-BTC ${fmt(j.sample?.trade_price)}원 · 데이터 age ${age(j.source_age_seconds)}`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
 async function runScan(mode){currentMode=mode;const db=$('dayBtn'),sb=$('swingBtn'),s=$('scanStatus'),r=$('results');db.disabled=true;sb.disabled=true;s.className='status';const isSwing=mode==='swing5d';s.innerHTML=`<span class="spinner"></span>${isSwing?'5일 스윙':'오늘 단타'}: KRW 전체 Ticker → 후보 압축 → 5m/15m/1h/4h/1d + 호가 분석 중...`;r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,top_n:5,shortlist_size:isSwing?18:10,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('');s.className='status good';s.textContent=`${j.mode_label} 완료 · 전체 ${j.ticker_rows}개 / 조건통과 ${j.eligible_rows}개 / 정밀분석 ${j.shortlist_size}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{db.disabled=false;sb.disabled=false}}
+async function runMacdScan(){const btn=$('macdBtn'),s=$('scanStatus'),r=$('results');btn.disabled=true;s.className='status';s.innerHTML='<span class="spinner"></span>원화마켓 전체 15분봉 검사 및 조건 후보의 1시간·4시간·일봉 확인 중...';r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan/macd-bb',{method:'POST'});r.innerHTML=(j.matches||[]).map(x=>`<div class="coin"><div class="coinTop"><div class="market">${x.market}</div><div><div class="price">₩ ${fmt(x.trade_price)}</div><div class="chg ${Number(x.signed_change_rate)>=0?'up':'down'}">${pct(x.signed_change_rate)}</div></div></div><div class="tf">${[['15m','15분'],['60m','1시간'],['240m','4시간'],['1d','1일']].map(([k,n])=>`<div class="tfline"><span class="pill">${n}</span> MACD ${fmt(x.timeframes[k].macd)} &gt; Signal ${fmt(x.timeframes[k].signal)}</div>`).join('')}<div class="tfline">15분 볼밴 폭 ${fmt(x.timeframes['15m'].bb_width_prev)} → ${fmt(x.timeframes['15m'].bb_width)}</div></div></div>`).join('')||'<div class="coin">조건에 맞는 코인이 없습니다.</div>';s.className='status good';s.textContent=`전체 ${j.ticker_rows}개 중 ${j.match_count}개 일치 · 조회 실패 ${j.errors.length}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{btn.disabled=false}}
 async function analyzeOne(){const m=$('market').value.trim().toUpperCase(),s=$('oneStatus'),r=$('results');if(!m)return;s.className='status';s.innerHTML='<span class="spinner"></span>'+m+' 분석 중...';try{const j=await fetchJSON('/api/analyze?market='+encodeURIComponent(m)+'&mode='+encodeURIComponent(currentMode));r.innerHTML=card(j,0);s.className='status good';s.textContent='완료 · '+(j.score_breakdown?.mode_label||'공식 Upbit Public API');}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
 setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})},1000);checkHealth();
 </script></body></html>'''
@@ -1027,6 +1105,14 @@ async def api_scan(request: Request) -> Response:
             mode=str(body.get("mode", "swing5d")),
         )
         return JSONResponse(data, headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=502)
+
+
+@mcp.custom_route("/api/scan/macd-bb", methods=["POST"])
+async def api_scan_macd_bb(request: Request) -> Response:
+    try:
+        return JSONResponse(await scan_macd_bb_expansion(), headers={"Cache-Control": "no-store"})
     except Exception as e:
         return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=502)
 
