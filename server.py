@@ -319,6 +319,11 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
     quote_values = [float(c.get("candle_acc_trade_price", 0) or 0) for c in candles]
 
     rsi14 = _rsi(close, 14)
+    ma5 = _sma(close, 5)
+    ma10 = _sma(close, 10)
+    ma20 = _sma(close, 20)
+    ma60 = _sma(close, 60)
+    ma120 = _sma(close, 120)
     ema20 = _ema(close, 20)
     ema60 = _ema(close, 60)
     macd = _macd(close)
@@ -382,6 +387,20 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
 
     recent7 = _recent_window_stats(7)
     recent14 = _recent_window_stats(14)
+
+    # Stochastic RSI (14,14): normalized RSI position in its recent 14-value range.
+    stoch_rsi = None
+    valid_rsi = [x for x in rsi14[max(0, last - 13): last + 1] if x is not None]
+    if len(valid_rsi) >= 2:
+        rlo, rhi = min(valid_rsi), max(valid_rsi)
+        if rhi != rlo and rsi14[last] is not None:
+            stoch_rsi = (float(rsi14[last]) - rlo) / (rhi - rlo) * 100.0
+
+    latest_c = candles[last]
+    prev_c = candles[last - 1] if last > 0 else latest_c
+    candle_range = float(latest_c['high_price']) - float(latest_c['low_price'])
+    upper_wick = max(0.0, float(latest_c['high_price']) - max(float(latest_c['opening_price']), float(latest_c['trade_price'])))
+    lower_wick = max(0.0, min(float(latest_c['opening_price']), float(latest_c['trade_price'])) - float(latest_c['low_price']))
     latest = raw[0]
     return {
         "timeframe": timeframe,
@@ -391,6 +410,16 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         "close": close[last],
         "open": float(latest["opening_price"]),
         "rsi14": rsi14[last],
+        "stoch_rsi14": stoch_rsi,
+        "ma5": ma5[last],
+        "ma10": ma10[last],
+        "ma20": ma20[last],
+        "ma60": ma60[last],
+        "ma120": ma120[last],
+        "ma5_slope_pct": ((ma5[last] / ma5[last-1] - 1.0) * 100.0) if last > 0 and ma5[last] and ma5[last-1] else None,
+        "ma10_slope_pct": ((ma10[last] / ma10[last-1] - 1.0) * 100.0) if last > 0 and ma10[last] and ma10[last-1] else None,
+        "ma20_slope_pct": ((ma20[last] / ma20[last-1] - 1.0) * 100.0) if last > 0 and ma20[last] and ma20[last-1] else None,
+        "ma_bullish_stack_5_10_20": bool(ma5[last] and ma10[last] and ma20[last] and ma5[last] > ma10[last] > ma20[last]),
         "ema20": ema20[last],
         "ema60": ema60[last],
         "ema20_above_ema60": (ema20[last] is not None and ema60[last] is not None and ema20[last] > ema60[last]),
@@ -398,6 +427,8 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         "macd_signal": macd["signal"][last],
         "macd_histogram": macd["histogram"][last],
         "macd_histogram_prev": macd["histogram"][last - 1] if last > 0 else None,
+        "macd_bullish": bool(macd["macd"][last] is not None and macd["signal"][last] is not None and macd["macd"][last] > macd["signal"][last]),
+        "macd_histogram_rising": bool(last > 0 and macd["histogram"][last] is not None and macd["histogram"][last-1] is not None and macd["histogram"][last] > macd["histogram"][last-1]),
         "macd_histogram_delta": (
             (macd["histogram"][last] - macd["histogram"][last - 1])
             if last > 0 and macd["histogram"][last] is not None and macd["histogram"][last - 1] is not None
@@ -416,6 +447,10 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         "volume_ratio20": (volumes[last] / v20) if v20 else None,
         "quote_volume": quote_values[last],
         "quote_volume_sma20": q20,
+        "candle_body_pct": ((float(latest_c["trade_price"]) / float(latest_c["opening_price"]) - 1.0) * 100.0) if float(latest_c["opening_price"]) else None,
+        "upper_wick_ratio": (upper_wick / candle_range) if candle_range else 0.0,
+        "lower_wick_ratio": (lower_wick / candle_range) if candle_range else 0.0,
+        "prev_close": float(prev_c["trade_price"]),
         "recent_high_20": max(float(c["high_price"]) for c in candles[max(0, last - 19): last + 1]),
         "recent_low_20": min(float(c["low_price"]) for c in candles[max(0, last - 19): last + 1]),
         "return_1bar_pct": _ret_bars(1),
@@ -446,9 +481,24 @@ async def _analyze_market_full(market: str) -> dict[str, Any]:
     top10_ask = sum(float(u.get("ask_size", 0) or 0) for u in units[:10])
     denom = top10_bid + top10_ask
 
+    core = [tf_results.get(k, {}) for k in ["15m", "60m", "240m", "1d"]]
+    all_macd_bullish = all(bool(x.get("macd_bullish")) for x in core)
+    bullish_count = sum(1 for x in core if x.get("macd_bullish"))
+    rising_hist_count = sum(1 for x in core if x.get("macd_histogram_rising"))
+    trend_snapshot = {
+        "all_15m_1h_4h_1d_macd_bullish": all_macd_bullish,
+        "macd_bullish_timeframes": bullish_count,
+        "macd_histogram_rising_timeframes": rising_hist_count,
+        "15m_price_up": (tf_results.get("15m", {}).get("close", 0) > tf_results.get("15m", {}).get("open", 0)),
+        "15m_bb_expanding": ((tf_results.get("15m", {}).get("bollinger_width") or 0) > (tf_results.get("15m", {}).get("bollinger_width_prev") or 0)),
+        "15m_volume_ratio20": tf_results.get("15m", {}).get("volume_ratio20"),
+        "1h_volume_ratio20": tf_results.get("60m", {}).get("volume_ratio20"),
+    }
+
     return {
         "market": market,
         "received_at_utc": _utc_now_iso(),
+        "trend_snapshot": trend_snapshot,
         "ticker": {
             **ticker_row,
             "source_age_seconds": _ms_age_seconds(ticker_row.get("timestamp")),
