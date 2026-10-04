@@ -186,6 +186,11 @@ async def _cached_candles(path: str, market: str, count: int) -> tuple[Any, dict
     async with _candle_locks.setdefault(key, asyncio.Lock()):
         cached = _candle_cache.get(key)
         unit = 86400 if path.endswith("days") else int(path.rsplit("/", 1)[1]) * 60
+        # Daily history is shared by pattern scanning and full analysis. Never
+        # reuse across the 00:00 UTC (09:00 KST) daily boundary.
+        if (path.endswith("days") and cached and time.monotonic() - cached[0] < 60
+                and cached[1] and cached[1][0]["candle_date_time_utc"][:10] == _utc_now_iso()[:10]):
+            return cached[1], {"x-candle-cache": "daily-60s"}
         # Reload both current and preceding bars; larger gaps require full history.
         incremental = cached is not None and time.monotonic() - cached[0] < unit
         raw, headers = await _get(path, {"market": market, "count": 2 if incremental else count})
@@ -992,8 +997,7 @@ def _early_score(tfs: dict[str, Any]) -> float:
     return score
 
 
-@mcp.tool()
-async def scan_krw_market(
+async def _legacy_scan_krw_market(
     top_n: int = 5, shortlist_size: int = 24,
     min_turnover_krw: float = 1_000_000_000, mode: str = "day",
 ) -> dict[str, Any]:
@@ -1052,6 +1056,279 @@ async def scan_krw_market(
             "remaining_req": headers.get("remaining-req"), "top_candidates": valid[:top_n],
             "shortlist_results": valid, "errors": errors,
             "early_results": [{"market": r["row"]["market"], "candidate_group": r["row"]["candidate_group"], "early_score": r["early_score"]} for r in early_results]}
+
+
+def _daily_pattern(raw: list[dict[str, Any]], as_of: datetime | None = None) -> dict[str, Any]:
+    """Causal daily setup: use only bars closed before as_of, never today's high.
+
+    Thresholds are broad screening heuristics, not fitted probabilities. A setup
+    is a watch candidate; it does not imply that a breakout will occur tomorrow.
+    """
+    as_of = as_of or datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    cutoff = as_of.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    unique = {c["candle_date_time_utc"]: c for c in raw}
+    bars = [c for k, c in sorted(unique.items())
+            if datetime.fromisoformat(k).replace(tzinfo=timezone.utc) < cutoff]
+    if len(bars) < 60:
+        return {"matched": False, "reason": "insufficient_closed_days", "closed_days": len(bars)}
+    last_date = datetime.fromisoformat(bars[-1]["candle_date_time_utc"]).replace(tzinfo=timezone.utc)
+    if (cutoff - last_date).days > 1:
+        return {"matched": False, "reason": "stale_daily_history", "closed_days": len(bars)}
+    c = [float(b["trade_price"]) for b in bars]
+    h = [float(b["high_price"]) for b in bars]
+    l = [float(b["low_price"]) for b in bars]
+    v = [float(b.get("candle_acc_trade_volume") or 0) for b in bars]
+    ma5, ma20 = _sma(c, 5), _sma(c, 20)
+    hist = _macd(c)["histogram"]
+    n = len(c) - 1
+    # Most recent occurrence of the highest high in the previous 14 sessions.
+    peak = max(range(n - 13, n + 1), key=lambda i: (h[i], i))
+    days = n - peak
+    base = min(l[max(0, peak - 20):peak])
+    peak_price = h[peak]
+    if base <= 0 or peak_price <= base:
+        return {"matched": False, "reason": "no_prior_impulse", "closed_days": len(bars)}
+    impulse = (peak_price / base - 1) * 100
+    pullback = (1 - c[n] / peak_price) * 100
+    correction_low = min(l[peak + 1:]) if days else l[n]
+    retracement = (peak_price - correction_low) / (peak_price - base)
+    vol_impulse = _mean(v[max(0, peak - 2):peak + 1]) or 0
+    vol_pullback = _mean(v[max(peak + 1, n - 2):n + 1]) or 0
+    volume_dry_ratio = vol_pullback / vol_impulse if vol_impulse else None
+    ma20_slope = (ma20[n] / ma20[n - 3] - 1) * 100 if ma20[n - 3] else 0
+    trend = ma20_slope > 0 and c[n] >= ma20[n] * 0.97
+    recent_hist = [x for x in hist[max(peak, n - 8):n + 1] if x is not None]
+    momentum_reset = len(recent_hist) > 1 and min(recent_hist) < max(recent_hist)
+    hist_turn = hist[n] is not None and hist[n - 1] is not None and hist[n] > hist[n - 1]
+    ma5_turn = bool(ma5[n] and ma5[n - 1] and ma5[n] > ma5[n - 1])
+    matched = bool(2 <= days <= 12 and impulse >= 15 and 3 <= pullback <= 40
+                   and retracement <= 0.75 and trend)
+    score = (30 + 15 * trend + 15 * (volume_dry_ratio is not None and volume_dry_ratio < 0.7)
+             + 10 * momentum_reset + 10 * hist_turn + 10 * ma5_turn
+             + 10 * (c[n] >= c[n - 1])) if matched else 0
+    return {
+        "matched": matched, "reason": "daily_pullback_setup" if matched else "structure_not_met",
+        "score": round(score, 2), "closed_days": len(bars),
+        "setup_as_of_kst": bars[-1].get("candle_date_time_kst"),
+        "peak_date_kst": bars[peak].get("candle_date_time_kst"),
+        "impulse_pct": round(impulse, 2), "pullback_pct": round(pullback, 2),
+        "pullback_days": days, "retracement_ratio": round(retracement, 3),
+        "volume_dry_ratio": round(volume_dry_ratio, 3) if volume_dry_ratio is not None else None,
+        "ma20_slope_3d_pct": round(ma20_slope, 3), "ma5_turn_up": ma5_turn,
+        "macd_histogram_turn_up": hist_turn, "momentum_reset": momentum_reset,
+        "last_closed_price": c[n], "ma5": ma5[n], "ma20": ma20[n],
+        "prior_peak": peak_price, "support": correction_low,
+        "trigger": max(h[n - 1:n + 1]),
+        "basis": "closed daily bars only; excludes current daily bar",
+    }
+
+
+def _pattern_state(pattern: dict[str, Any], row: dict[str, Any]) -> tuple[str, list[str]]:
+    price = float(row.get("trade_price") or 0)
+    change = float(row.get("signed_change_rate") or 0) * 100
+    risks = []
+    if change > 18:
+        risks.append("당일 18% 초과·추격주의")
+    if not pattern.get("matched"):
+        return ("extended" if change > 18 else "unmatched"), risks
+    if price < pattern["support"]:
+        return "invalidated", risks + ["조정 저점 이탈"]
+    extension = (price / pattern["ma20"] - 1) * 100 if pattern.get("ma20") else 0
+    if change > 18 or extension > 35:
+        return "extended", risks + (["20일선 이격 35% 초과"] if extension > 35 else [])
+    if price > pattern["trigger"] and price > pattern["ma5"]:
+        return "triggered", risks
+    return "watch", risks
+
+
+_pattern_scan_lock = asyncio.Lock()
+_daily_setup_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+
+async def _setup_daily_history(market: str, as_of: datetime) -> list[dict[str, Any]]:
+    """Closed setup bars do not change during a UTC day. Live daily indicators
+    still use _cached_candles separately for shortlisted markets.
+    """
+    day = as_of.astimezone(timezone.utc).date().isoformat()
+    key = (market, day)
+    if key in _daily_setup_cache:
+        return _daily_setup_cache[key]
+    raw, _ = await _cached_candles("/v1/candles/days", market, 200)
+    closed = [c for c in raw if c["candle_date_time_utc"][:10] < day]
+    # Do not retain missing/stale responses until tomorrow; allow a retry.
+    previous_day = datetime.fromtimestamp(as_of.timestamp() - 86400, timezone.utc).date().isoformat()
+    if closed and closed[0]["candle_date_time_utc"][:10] == previous_day:
+        for old in [k for k in _daily_setup_cache if k[0] == market and k != key]:
+            del _daily_setup_cache[old]
+        _daily_setup_cache[key] = closed
+    return closed
+
+
+@mcp.tool()
+async def scan_krw_market(
+    top_n: int = 5, shortlist_size: int = 24,
+    min_turnover_krw: float = 1_000_000_000, mode: str = "day",
+) -> dict[str, Any]:
+    """Day: EVERY KRW daily setup -> 4h/1h -> finalists. Includes all setup
+    matches and extended movers separately. Scores are not probabilities.
+    swing5d retains the legacy opt-in scanner. No orders are submitted.
+    """
+    mode = (mode or "day").strip().lower()
+    if mode == "swing5d":
+        return await _legacy_scan_krw_market(top_n, shortlist_size, min_turnover_krw, mode)
+    if mode != "day":
+        raise ValueError("mode must be 'day' or 'swing5d'")
+    async with _pattern_scan_lock:
+        return await _scan_daily_first(top_n, shortlist_size, min_turnover_krw)
+
+
+async def _scan_daily_first(top_n: int, shortlist_size: int, min_turnover_krw: float) -> dict[str, Any]:
+    started = time.monotonic()
+    as_of = datetime.now(timezone.utc)
+    top_n = max(1, min(int(top_n), 10))
+    shortlist_size = max(top_n, min(int(shortlist_size), 30))
+    min_turnover_krw = max(0, float(min_turnover_krw))
+    tickers, headers = await _get("/v1/ticker/all", {"quote_currencies": "KRW"})
+    rows = [dict(r) for r in tickers if r["market"].startswith("KRW-")]
+    errors, checked, excluded = [], [], []
+    details, _ = await _get("/v1/market/all", {"is_details": "true"})
+    events = {r["market"]: r.get("market_event", {"warning": r.get("market_warning") == "CAUTION"}) for r in details}
+    semaphore = asyncio.Semaphore(6)
+    stablecoins = {"KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-USDE", "KRW-USDS", "KRW-USD1"}
+
+    async def daily(row: dict[str, Any]) -> None:
+        async with semaphore:
+            try:
+                raw = await _setup_daily_history(row["market"], as_of)
+                p = _daily_pattern(raw, as_of)
+                checked.append({"row": row, "pattern": p})
+            except Exception as exc:
+                errors.append({"market": row["market"], "stage": "daily", "error": str(exc)})
+    await asyncio.gather(*(daily(row) for row in rows))
+    patterns, movers = [], []
+    labels = {"watch": "재상승 대기", "triggered": "재상승 신호(미확정)",
+              "extended": "이미 급등·추격주의", "invalidated": "지지 이탈", "unmatched": "패턴 불일치"}
+
+    def pack(row: dict[str, Any], p: dict[str, Any]) -> dict[str, Any]:
+        state, risks = _pattern_state(p, row)
+        event = events.get(row["market"], {})
+        turnover = float(row.get("acc_trade_price_24h") or 0)
+        if turnover < min_turnover_krw:
+            risks.append("거래대금 기준 미달")
+        if event.get("warning"):
+            risks.append("거래 유의 지정")
+        risks += ["주의: " + k for k, value in event.get("caution", {}).items() if value]
+        if row["market"] in stablecoins:
+            risks.append("스테이블코인 제외")
+        if row["market"] not in events:
+            risks.append("유의 상태 확인 불가")
+        trade_age = _ms_age_seconds(row.get("trade_timestamp") or row.get("timestamp"))
+        fresh_trade = trade_age is not None and trade_age <= 120
+        if not fresh_trade:
+            risks.append("최근 체결 2분 초과 또는 시각 불명")
+        return {"market": row["market"], "trade_price": row.get("trade_price"),
+                "signed_change_rate": row.get("signed_change_rate"), "acc_trade_price_24h": turnover,
+                "ticker_source_age_seconds": _ms_age_seconds(row.get("timestamp")),
+                "last_trade_age_seconds": trade_age,
+                "last_trade_kst": str(row.get("trade_date_kst", "")) + " " + str(row.get("trade_time_kst", "")),
+                "daily_pattern": p, "state": state, "state_label": labels[state], "risk_flags": risks,
+                "market_event": event, "entry_eligible": bool(p.get("matched") and state in {"watch", "triggered"}
+                    and turnover >= min_turnover_krw and not event.get("warning")
+                    and fresh_trade and row["market"] in events and row["market"] not in stablecoins)}
+
+    for item in checked:
+        x = pack(item["row"], item["pattern"])
+        if item["pattern"].get("matched"):
+            patterns.append(x)
+        else:
+            excluded.append({"market": x["market"], "reason": item["pattern"].get("reason")})
+        if float(item["row"].get("signed_change_rate") or 0) > 0.18:
+            movers.append(x)
+    eligible = sorted([x for x in patterns if x["entry_eligible"]],
+                      key=lambda x: (x["daily_pattern"]["score"], x["acc_trade_price_24h"]), reverse=True)
+    # Retain both waiting and triggered setups before filling by daily score.
+    shortlist = []
+    pools = [[x for x in eligible if x["state"] == state] for state in ("watch", "triggered")]
+    while len(shortlist) < shortlist_size and any(pools):
+        for pool in pools:
+            if pool and len(shortlist) < shortlist_size:
+                shortlist.append(pool.pop(0))
+
+    async def confirm(x: dict[str, Any]) -> dict[str, Any] | None:
+        async with semaphore:
+            try:
+                values = await asyncio.gather(*(_analyze_tf(x["market"], tf) for tf in ("240m", "60m")))
+                if any(t.get("error") for t in values):
+                    raise ValueError("insufficient confirmation candles")
+                tfs = dict(zip(("240m", "60m"), values))
+                confirmation = sum(5 * bool(t.get("macd_bullish")) + 5 * bool(t.get("macd_histogram_rising")) for t in values)
+                return {**x, "early_score": x["daily_pattern"]["score"] * 0.8 + confirmation, "tfs": tfs}
+            except Exception as exc:
+                errors.append({"market": x["market"], "stage": "confirmation", "error": str(exc)})
+                return None
+    confirmed = [x for x in await asyncio.gather(*(confirm(x) for x in shortlist)) if x]
+    confirmed.sort(key=lambda x: x["early_score"], reverse=True)
+    finalists = confirmed[:max(6, top_n)]
+    books, book_headers = ([], {})
+    if finalists:
+        books, book_headers = await _get("/v1/orderbook", {"markets": ",".join(x["market"] for x in finalists)})
+    book_map = {b["market"]: b for b in books}
+
+    async def full(x: dict[str, Any]) -> dict[str, Any] | None:
+        async with semaphore:
+            try:
+                if x["market"] not in book_map:
+                    raise ValueError("missing orderbook")
+                a = await _analyze_market_full(x["market"], precomputed=x["tfs"],
+                                             orderbook_row=book_map[x["market"]], orderbook_headers=book_headers)
+                fresh = pack(a["ticker"], x["daily_pattern"])
+                b = _score_market(a, a["ticker"], "day")
+                pattern_score = x["daily_pattern"]["score"]
+                score = round(0.6 * pattern_score + 0.4 * b["total_score"], 3)
+                b.update({"technical_only_score": b["total_score"], "pattern_score": pattern_score,
+                          "total_score": score, "mode_label": "일봉 재상승", "tags": fresh["risk_flags"] + b["tags"]})
+                return {**fresh, "early_score": x["early_score"], "technical_screen_score": score,
+                        "score_breakdown": b, "analysis": a}
+            except Exception as exc:
+                errors.append({"market": x["market"], "stage": "full", "error": str(exc)})
+                return None
+    valid = [x for x in await asyncio.gather(*(full(x) for x in finalists)) if x]
+    # Refresh the whole ticker snapshot after the scan, so day-stage prices are
+    # never presented as current after a potentially long first scan.
+    latest, _ = await _get("/v1/ticker/all", {"quote_currencies": "KRW"})
+    fresh_map = {r["market"]: r for r in latest}
+    def refresh(x: dict[str, Any]) -> dict[str, Any]:
+        row = fresh_map.get(x["market"])
+        if row is None:
+            return {**x, "entry_eligible": False, "risk_flags": x["risk_flags"] + ["현재가 조회 실패"]}
+        return {**x, **pack(row, x["daily_pattern"])}
+    patterns = [refresh(x) for x in patterns]
+    # Every >18% mover remains visible, even if it did not match this pattern.
+    pattern_map = {i["row"]["market"]: i["pattern"] for i in checked}
+    movers = [pack(r, pattern_map.get(r["market"], {"matched": False, "reason": "daily_failed"}))
+              for r in latest if r["market"].startswith("KRW-") and float(r.get("signed_change_rate") or 0) > 0.18]
+    valid = [refresh(x) for x in valid]
+    valid.sort(key=lambda x: x["technical_screen_score"], reverse=True)
+    patterns.sort(key=lambda x: x["daily_pattern"]["score"], reverse=True)
+    day_changed = as_of.date() != datetime.now(timezone.utc).date()
+    if day_changed:
+        for x in valid + patterns:
+            x["entry_eligible"] = False
+            x["risk_flags"].append("일봉 마감 경계 통과·재조회 필요")
+    return {"version": "3.1-daily-first", "received_at_utc": _utc_now_iso(), "scan_started_at_utc": as_of.isoformat(),
+            "mode": "day", "mode_label": "일봉 재상승", "method": "all KRW closed daily setup -> 4h/1h -> finalists",
+            "important": "Setup scores are not probabilities. Watch is not an entry signal. Live signals can reverse.",
+            "ticker_rows": len(rows), "daily_checked_rows": len(checked), "daily_match_count": len(patterns),
+            "eligible_rows": sum(x["entry_eligible"] for x in patterns), "shortlist_size": len(shortlist),
+            "full_analysis_count": len(valid), "elapsed_seconds": round(time.monotonic() - started, 3),
+            "remaining_req": headers.get("remaining-req"), "errors": errors, "excluded": excluded,
+            "top_candidates": [x for x in valid if x["entry_eligible"]][:top_n],
+            "shortlist_results": valid, "daily_candidates": patterns, "extended_movers": movers,
+            "overheated_markets": [x["market"] for x in movers],
+            "closed_daily_cache": "until next 09:00 KST; in-memory", "live_daily_cache_ttl_seconds": 60,
+            "day_boundary_crossed": day_changed}
 
 
 def _matches_macd_expansion(t: dict[str, Any], rising_15m: bool = False) -> bool:
@@ -1146,11 +1423,11 @@ MOBILE_HTML = r'''<!doctype html>
   </style>
 </head>
 <body><div class="wrap">
-  <div class="head"><div><h1>업비트 풀체크 v3</h1><div class="sub">Upbit Public API 직접 조회 · 현재봉 갱신 · 과거봉 캐시 · 급등 리스크/드라이브 성향 추가</div></div><div class="badge" id="clock">-</div></div>
-  <div class="panel"><div class="row"><button id="dayBtn" onclick="runScan('day')">오늘 단타 TOP 5</button><button id="swingBtn" class="swing" onclick="runScan('swing5d')">5일 스윙 TOP 5</button><button id="macdBtn" onclick="runMacdScan()">4개 봉 MACD + 15분 볼밴 확장</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div class="modehint">새 버튼: 원화마켓 전체에서 현재 진행 중인 15분·1시간·4시간·1일봉 MACD가 시그널 위에 있고, 15분봉 종가가 시가보다 높으며 15분 볼밴 폭이 직전 봉보다 큰 종목을 전부 표시합니다. 전체 조회에는 시간이 걸릴 수 있습니다.</div><div id="scanStatus" class="status">원하는 모드를 누르세요. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
+  <div class="head"><div><h1>업비트 풀체크 v3</h1><div class="sub">V3.1 · 전체 일봉 선별 · 조정 후 재상승 · 급등 종목 별도 표시</div></div><div class="badge" id="clock">-</div></div>
+  <div class="panel"><div class="row"><button id="dayBtn" onclick="runScan('day')">일봉 재상승 TOP 5</button><button id="swingBtn" class="swing" onclick="runScan('swing5d')">5일 스윙 TOP 5</button><button id="macdBtn" onclick="runMacdScan()">4개 봉 MACD + 15분 볼밴 확장</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div class="modehint">전체 원화 종목의 마감된 일봉에서 1차 상승·조정·상승 추세 유지를 찾습니다. 관찰 후보는 매수 신호가 아닙니다. 4시간·1시간 확인 후 상위 후보를 표시하며, 이미 급등한 종목도 별도로 남깁니다. 첫 전체 조회에는 시간이 걸릴 수 있습니다.</div><div id="scanStatus" class="status">원하는 모드를 누르세요. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
   <div class="panel"><div class="row"><input id="market" value="KRW-QUID" placeholder="예: KRW-BTC"/><button class="secondary" onclick="analyzeOne()">현재 모드로 종목 분석</button></div><div id="oneStatus" class="status"></div></div>
   <div id="results" class="cards"></div>
-  <div class="foot">점수는 미래 수익률 확률이 아니라 규칙 기반 스크리닝 점수입니다. 최근 급등 리스크와 드라이브 성향은 3·5·7일 수익률, 7일 런업/고점대비 조정, RSI·볼린저·거래량·호가·MACD 변화로 계산합니다. 현재가·호가·캔들 source age가 오래되면 감점됩니다.</div>
+  <div class="foot">점수는 급등 확률이 아닙니다. 일봉 구조 60%와 기술 점수 40%를 합산합니다. 구조는 마감봉, 재상승 신호는 현재가 기준이며 변할 수 있습니다. 두 사례를 확인했으며 전체 시장 예측 성능은 아직 검증하지 않았습니다. 최근 급등 리스크와 드라이브 성향은 3·5·7일 수익률, 7일 런업/고점대비 조정, RSI·볼린저·거래량·호가·MACD 변화로 계산합니다. 현재가·호가·캔들 source age가 오래되면 감점됩니다.</div>
 </div>
 <script>
 const $=id=>document.getElementById(id);let currentMode='day';
@@ -1161,11 +1438,13 @@ const age=n=>n===null||n===undefined?'-':(Number(n)<5?Number(n).toFixed(1)+'초'
 function tfSummary(t){if(!t||t.error)return'데이터 부족';const d=t.macd_histogram_delta;return`RSI ${fmt(t.rsi14)} · MACD H ${fmt(t.macd_histogram)}${d==null?'':(' Δ'+fmt(d))} · EMA20${t.ema20_above_ema60?'>':'<'}60 · BB%B ${fmt(t.bollinger_percent_b)} · Vol× ${fmt(t.volume_ratio20)} · age ${age(t.latest_source_age_seconds)}`}
 function scoreGrid(b){if(!b)return'';return`<div class="scores"><div class="score"><div class="k">추세</div><div class="v">${fmt(b.trend_score)}</div></div><div class="score"><div class="k">거래량</div><div class="v">${fmt(b.volume_score)}</div></div><div class="score"><div class="k">진입</div><div class="v">${fmt(b.entry_score)}</div></div><div class="score"><div class="k">호가</div><div class="v">${fmt(b.orderbook_score)}</div></div><div class="score"><div class="k">유동성</div><div class="v">${fmt(b.liquidity_score)}</div></div><div class="score pen"><div class="k">과열 감점</div><div class="v">-${fmt(b.heat_penalty)}</div></div><div class="score pen"><div class="k">최근급등 리스크</div><div class="v">${fmt(b.surge_risk)}/100</div></div><div class="score"><div class="k">드라이브 성향</div><div class="v">${b.drive_profile||'-'}</div></div><div class="score"><div class="k">드라이브 보정</div><div class="v">${Number(b.drive_bonus||0)>=0?'+':''}${fmt(b.drive_bonus)}</div></div></div>`}
 function tagHtml(tags){return(tags||[]).length?`<div class="tags">${tags.map(t=>`<span class="tag ${t.includes('주의')||t.includes('매도')?'warn':''}">${t}</span>`).join('')}</div>`:''}
-function card(x,i){const a=x.analysis||x,t=a.ticker||{},m=x.market||a.market||t.market||'-',ch=Number(x.signed_change_rate??t.signed_change_rate??0),cls=ch>=0?'up':'down',ob=a.orderbook_summary||{},tfs=a.timeframes||{},b=x.score_breakdown||x.score||{},label=b.mode_label||'종목 분석',total=b.total_score??x.technical_screen_score;return`<div class="coin"><div class="coinTop"><div><div class="rank">${i?('#'+i):'종목 분석'} · ${label} ${fmt(total)}점</div><div class="market">${m}</div></div><div><div class="price">₩ ${fmt(x.trade_price??t.trade_price)}</div><div class="chg ${cls}">${pct(ch)}</div></div></div>${tagHtml(b.tags)}${scoreGrid(b)}<div class="grid"><div class="metric"><div class="k">24H 거래대금</div><div class="v">${won(x.acc_trade_price_24h??t.acc_trade_price_24h)}</div></div><div class="metric"><div class="k">Ticker age</div><div class="v">${age(x.ticker_source_age_seconds??t.source_age_seconds)}</div></div><div class="metric"><div class="k">Best bid / ask</div><div class="v">${fmt(ob.best_bid)} / ${fmt(ob.best_ask)}</div></div><div class="metric"><div class="k">Top10 호가 imbalance</div><div class="v">${ob.top10_imbalance==null?'-':(Number(ob.top10_imbalance)*100).toFixed(1)+'%'}</div></div></div>${b.recent_surge?`<div class="tf"><div class="tfline"><span class="pill">최근급등</span> 3D ${fmt(b.recent_surge.recent_return_3d_pct)}% · 5D ${fmt(b.recent_surge.recent_return_5d_pct)}% · 7D ${fmt(b.recent_surge.recent_return_7d_pct)}% · 7D저점대비 ${fmt(b.recent_surge.runup_7d_pct)}% · 7D고점대비 ${fmt(b.recent_surge.drawdown_from_7d_high_pct)}%</div></div>`:''}<div class="tf"><div class="tfline"><span class="pill">5m</span> ${tfSummary(tfs['5m'])}</div><div class="tfline"><span class="pill">15m</span> ${tfSummary(tfs['15m'])}</div><div class="tfline"><span class="pill">1h</span> ${tfSummary(tfs['60m'])}</div><div class="tfline"><span class="pill">4h</span> ${tfSummary(tfs['240m'])}</div><div class="tfline"><span class="pill">1d</span> ${tfSummary(tfs['1d'])}</div></div></div>`}
+function patternHtml(x){const p=x.daily_pattern;if(!p)return'';return `<div class="tf"><div class="tfline"><b>${x.state_label||'일봉 패턴'}</b> · 일봉 구조 ${fmt(p.score)}점</div><div class="tfline">${p.setup_as_of_kst||'-'} 봉까지 · ${fmt(p.pullback_days)}일 조정 · 고점 대비 -${fmt(p.pullback_pct)}%</div><div class="tfline">조정 거래량 / 상승 구간 ${fmt(p.volume_dry_ratio)}배 · 20일선 변화 ${fmt(p.ma20_slope_3d_pct)}%</div><div class="tfline">재상승 확인선 ${fmt(p.trigger)} · 조정 저점 ${fmt(p.support)} · 이전 고점 ${fmt(p.prior_peak)}</div>${tagHtml(x.risk_flags)}</div>`}
+function compactPattern(x){const p=x.daily_pattern||{};return `<div class="coin"><div class="coinTop"><div><b>${x.market}</b><div class="rank">${x.state_label}</div></div><div>₩ ${fmt(x.trade_price)}<div class="chg ${x.signed_change_rate>=0?'up':'down'}">${pct(x.signed_change_rate)}</div></div></div>${p.matched?patternHtml(x):tagHtml(x.risk_flags)}<div class="tfline">24H ${won(x.acc_trade_price_24h)} · 마지막 체결 ${age(x.last_trade_age_seconds)} 전</div></div>`}
+function card(x,i){const a=x.analysis||x,t=a.ticker||{},m=x.market||a.market||t.market||'-',ch=Number(x.signed_change_rate??t.signed_change_rate??0),cls=ch>=0?'up':'down',ob=a.orderbook_summary||{},tfs=a.timeframes||{},b=x.score_breakdown||x.score||{},label=b.mode_label||'종목 분석',total=b.total_score??x.technical_screen_score;return`<div class="coin"><div class="coinTop"><div><div class="rank">${i?('#'+i):'종목 분석'} · ${label} ${fmt(total)}점</div><div class="market">${m}</div></div><div><div class="price">₩ ${fmt(x.trade_price??t.trade_price)}</div><div class="chg ${cls}">${pct(ch)}</div></div></div>${patternHtml(x)}${tagHtml(b.tags)}${scoreGrid(b)}<div class="grid"><div class="metric"><div class="k">24H 거래대금</div><div class="v">${won(x.acc_trade_price_24h??t.acc_trade_price_24h)}</div></div><div class="metric"><div class="k">Ticker age</div><div class="v">${age(x.ticker_source_age_seconds??t.source_age_seconds)}</div></div><div class="metric"><div class="k">Best bid / ask</div><div class="v">${fmt(ob.best_bid)} / ${fmt(ob.best_ask)}</div></div><div class="metric"><div class="k">Top10 호가 imbalance</div><div class="v">${ob.top10_imbalance==null?'-':(Number(ob.top10_imbalance)*100).toFixed(1)+'%'}</div></div></div>${b.recent_surge?`<div class="tf"><div class="tfline"><span class="pill">최근급등</span> 3D ${fmt(b.recent_surge.recent_return_3d_pct)}% · 5D ${fmt(b.recent_surge.recent_return_5d_pct)}% · 7D ${fmt(b.recent_surge.recent_return_7d_pct)}% · 7D저점대비 ${fmt(b.recent_surge.runup_7d_pct)}% · 7D고점대비 ${fmt(b.recent_surge.drawdown_from_7d_high_pct)}%</div></div>`:''}<div class="tf"><div class="tfline"><span class="pill">5m</span> ${tfSummary(tfs['5m'])}</div><div class="tfline"><span class="pill">15m</span> ${tfSummary(tfs['15m'])}</div><div class="tfline"><span class="pill">1h</span> ${tfSummary(tfs['60m'])}</div><div class="tfline"><span class="pill">4h</span> ${tfSummary(tfs['240m'])}</div><div class="tfline"><span class="pill">1d</span> ${tfSummary(tfs['1d'])}</div></div></div>`}
 async function fetchJSON(url,opt){const r=await fetch(url,opt),tx=await r.text();let j;try{j=JSON.parse(tx)}catch(e){throw new Error(`HTTP ${r.status}: ${tx.slice(0,180)}`)}if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j}
 async function checkHealth(){const s=$('scanStatus');s.className='status';s.innerHTML='<span class="spinner"></span>업비트 연결 확인 중...';try{const j=await fetchJSON('/api/health');s.className='status good';s.textContent=`정상 · KRW-BTC ${fmt(j.sample?.trade_price)}원 · 데이터 age ${age(j.source_age_seconds)}`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
-async function runScan(mode){currentMode=mode;const db=$('dayBtn'),sb=$('swingBtn'),s=$('scanStatus'),r=$('results');db.disabled=true;sb.disabled=true;s.className='status';const isSwing=mode==='swing5d';s.innerHTML=`<span class="spinner"></span>${isSwing?'5일 스윙':'오늘 단타'}: KRW 전체 → 다중 후보 → 15분·1시간 → 상위 후보 정밀분석 중...`;r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,top_n:5,shortlist_size:24,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('');s.className='status good';s.textContent=`${j.mode_label} 완료 · 전체 ${j.ticker_rows}개 / 조건통과 ${j.eligible_rows}개 / 1차 ${j.shortlist_size}개 / 정밀 ${j.full_analysis_count}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{db.disabled=false;sb.disabled=false}}
-async function runMacdScan(){const btn=$('macdBtn'),s=$('scanStatus'),r=$('results');btn.disabled=true;s.className='status';s.innerHTML='<span class="spinner"></span>원화마켓 전체 15분봉 검사 및 조건 후보의 1시간·4시간·일봉 확인 중...';r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan/macd-bb',{method:'POST'});r.innerHTML=(j.matches||[]).map(x=>`<div class="coin"><div class="coinTop"><div class="market">${x.market}</div><div><div class="price">₩ ${fmt(x.trade_price)}</div><div class="chg ${Number(x.signed_change_rate)>=0?'up':'down'}">${pct(x.signed_change_rate)}</div></div></div><div class="tf">${[['15m','15분'],['60m','1시간'],['240m','4시간'],['1d','1일']].map(([k,n])=>`<div class="tfline"><span class="pill">${n}</span> MACD ${fmt(x.timeframes[k].macd)} &gt; Signal ${fmt(x.timeframes[k].signal)}</div>`).join('')}<div class="tfline">15분 볼밴 폭 ${fmt(x.timeframes['15m'].bb_width_prev)} → ${fmt(x.timeframes['15m'].bb_width)}</div></div></div>`).join('')||'<div class="coin">조건에 맞는 코인이 없습니다.</div>';s.className='status good';s.textContent=`전체 ${j.ticker_rows}개 중 ${j.match_count}개 일치 · 조회 실패 ${j.errors.length}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{btn.disabled=false}}
+async function runScan(mode){currentMode=mode;const db=$('dayBtn'),sb=$('swingBtn'),mb=$('macdBtn'),s=$('scanStatus'),r=$('results');db.disabled=sb.disabled=mb.disabled=true;s.className='status';s.innerHTML='<span class="spinner"></span>'+(mode==='day'?'전체 일봉 확인 → 조정·재상승 후보 선별 → 4시간·1시간 확인 중...':'5일 스윙 후보 확인 중...');r.innerHTML='';try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,top_n:5,shortlist_size:24,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('')||'<div class="coin">현재 진입 검토 기준에 맞는 정밀 후보가 없습니다.</div>';if(j.daily_candidates){r.innerHTML+='<div class="panel" style="grid-column:1/-1"><b>일봉 패턴 전체 '+j.daily_candidates.length+'개</b><div class="sub">정밀분석 여부와 관계없이 모두 표시 · 거래대금 부족·유의·지지 이탈 포함</div></div>'+j.daily_candidates.map(compactPattern).join('');r.innerHTML+='<div class="panel" style="grid-column:1/-1"><b>이미 급등한 종목 '+j.extended_movers.length+'개</b><div class="sub">발견 목록 · 신규 매수 추천이 아닙니다</div></div>'+j.extended_movers.map(compactPattern).join('');}const errs=j.errors||[];s.className=errs.length||j.day_boundary_crossed?'status bad':'status good';s.textContent=j.mode_label+' · 전체 '+j.ticker_rows+'개 / 일봉 확인 '+(j.daily_checked_rows??'-')+'개 / 패턴 '+(j.daily_match_count??'-')+'개 / 정밀 '+j.full_analysis_count+'개 / 오류 '+errs.length+'건 · '+new Date(j.received_at_utc).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})+' 한국시간';if(errs.length)s.textContent+=' · 미완료 종목: '+errs.map(e=>e.market).join(', ');if(j.day_boundary_crossed)s.textContent+=' · 오전 9시 일봉 전환: 재조회 필요';}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{db.disabled=sb.disabled=mb.disabled=false}}
+async function runMacdScan(){const btn=$('macdBtn'),s=$('scanStatus'),r=$('results');btn.disabled=$('dayBtn').disabled=$('swingBtn').disabled=true;s.className='status';s.innerHTML='<span class="spinner"></span>원화마켓 전체 15분봉 검사 및 조건 후보의 1시간·4시간·일봉 확인 중...';r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan/macd-bb',{method:'POST'});r.innerHTML=(j.matches||[]).map(x=>`<div class="coin"><div class="coinTop"><div class="market">${x.market}</div><div><div class="price">₩ ${fmt(x.trade_price)}</div><div class="chg ${Number(x.signed_change_rate)>=0?'up':'down'}">${pct(x.signed_change_rate)}</div></div></div><div class="tf">${[['15m','15분'],['60m','1시간'],['240m','4시간'],['1d','1일']].map(([k,n])=>`<div class="tfline"><span class="pill">${n}</span> MACD ${fmt(x.timeframes[k].macd)} &gt; Signal ${fmt(x.timeframes[k].signal)}</div>`).join('')}<div class="tfline">15분 볼밴 폭 ${fmt(x.timeframes['15m'].bb_width_prev)} → ${fmt(x.timeframes['15m'].bb_width)}</div></div></div>`).join('')||'<div class="coin">조건에 맞는 코인이 없습니다.</div>';s.className='status good';s.textContent=`전체 ${j.ticker_rows}개 중 ${j.match_count}개 일치 · 조회 실패 ${j.errors.length}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{btn.disabled=$('dayBtn').disabled=$('swingBtn').disabled=false}}
 async function analyzeOne(){const m=$('market').value.trim().toUpperCase(),s=$('oneStatus'),r=$('results');if(!m)return;s.className='status';s.innerHTML='<span class="spinner"></span>'+m+' 분석 중...';try{const j=await fetchJSON('/api/analyze?market='+encodeURIComponent(m)+'&mode='+encodeURIComponent(currentMode));r.innerHTML=card(j,0);s.className='status good';s.textContent='완료 · '+(j.score_breakdown?.mode_label||'공식 Upbit Public API');}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
 setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})},1000);checkHealth();
 </script></body></html>'''
