@@ -149,17 +149,52 @@ def _atr(candles_asc: list[dict[str, Any]], period: int = 14) -> list[float | No
     return out
 
 
+# One connection pool and shared per-group pacing across all tools.
+_http_client: httpx.AsyncClient | None = None
+_rate_locks: dict[str, asyncio.Lock] = {}
+_rate_next: dict[str, float] = {}
+_candle_cache: dict[tuple[str, str, int], tuple[float, list[dict[str, Any]]]] = {}
+_candle_locks: dict[tuple[str, str, int], asyncio.Lock] = {}
+
+
+async def _pace(group: str) -> None:
+    async with _rate_locks.setdefault(group, asyncio.Lock()):
+        await asyncio.sleep(max(0.0, _rate_next.get(group, 0.0) - time.monotonic()))
+        _rate_next[group] = time.monotonic() + 0.115
+
+
 async def _get(path: str, params: dict[str, Any] | None = None, retries: int = 3) -> tuple[Any, dict[str, str]]:
-    url = f"{BASE_URL}{path}"
-    async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
-        for attempt in range(retries + 1):
-            resp = await client.get(url, params=params)
-            if resp.status_code == 429 and attempt < retries:
-                await asyncio.sleep(0.35 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            return resp.json(), dict(resp.headers)
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS)
+    group = "candle" if path.startswith("/v1/candles/") else path.split("/")[2]
+    for attempt in range(retries + 1):
+        await _pace(group)
+        resp = await _http_client.get(f"{BASE_URL}{path}", params=params)
+        if resp.status_code in {429, 418} and attempt < retries:
+            delay = max(float(resp.headers.get("Retry-After", "1")), 0.5 * (attempt + 1))
+            _rate_next[group] = max(_rate_next.get(group, 0.0), time.monotonic() + delay)
+            await asyncio.sleep(delay)
+            continue
+        resp.raise_for_status()
+        return resp.json(), dict(resp.headers)
     raise RuntimeError("unreachable")
+
+
+async def _cached_candles(path: str, market: str, count: int) -> tuple[Any, dict[str, str]]:
+    key = (path, market, count)
+    async with _candle_locks.setdefault(key, asyncio.Lock()):
+        cached = _candle_cache.get(key)
+        unit = 86400 if path.endswith("days") else int(path.rsplit("/", 1)[1]) * 60
+        # Reload both current and preceding bars; larger gaps require full history.
+        incremental = cached is not None and time.monotonic() - cached[0] < unit
+        raw, headers = await _get(path, {"market": market, "count": 2 if incremental else count})
+        if incremental:
+            merged = {c["candle_date_time_utc"]: c for c in cached[1]}
+            merged.update({c["candle_date_time_utc"]: c for c in raw})
+            raw = sorted(merged.values(), key=lambda c: c["candle_date_time_utc"], reverse=True)[:count]
+        _candle_cache[key] = (time.monotonic(), raw)
+        return raw, headers
 
 
 def _wrap(data: Any, headers: dict[str, str], endpoint: str) -> dict[str, Any]:
@@ -310,7 +345,7 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
         "1d": "/v1/candles/days",
     }
     path = path_map[timeframe]
-    raw, headers = await _get(path, {"market": market, "count": max(60, min(count, 200))})
+    raw, headers = await _cached_candles(path, market, max(60, min(count, 200)))
     if len(raw) < 35:
         return {"timeframe": timeframe, "error": "insufficient candles", "count": len(raw)}
     candles = list(reversed(raw))  # ascending
@@ -464,18 +499,27 @@ async def _analyze_tf(market: str, timeframe: str, count: int = 200) -> dict[str
     }
 
 
-async def _analyze_market_full(market: str) -> dict[str, Any]:
-    ticker_task = _get("/v1/ticker", {"markets": market})
-    orderbook_task = _get("/v1/orderbook", {"markets": market})
-    # Stay below Upbit Candle group's 10 req/s limit.
-    tf_results: dict[str, Any] = {}
-    for tf in ["5m", "15m", "60m", "240m", "1d"]:
-        tf_results[tf] = await _analyze_tf(market, tf)
-        await asyncio.sleep(0.12)
-    (ticker, ticker_h), (orderbook, ob_h) = await asyncio.gather(ticker_task, orderbook_task)
-
-    ticker_row = ticker[0] if ticker else {}
-    ob_row = orderbook[0] if orderbook else {}
+async def _analyze_market_full(
+    market: str, ticker_row: dict[str, Any] | None = None,
+    precomputed: dict[str, Any] | None = None,
+    orderbook_row: dict[str, Any] | None = None,
+    orderbook_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    tf_results = dict(precomputed or {})
+    missing = [tf for tf in ("5m", "15m", "60m", "240m", "1d") if tf not in tf_results]
+    results = await asyncio.gather(*(_analyze_tf(market, tf) for tf in missing))
+    tf_results.update(zip(missing, results))
+    if any(t.get("error") for t in tf_results.values()):
+        raise ValueError("insufficient candles for full analysis")
+    ticker_h: dict[str, str] = {}
+    if ticker_row is None:
+        ticker, ticker_h = await _get("/v1/ticker", {"markets": market})
+        ticker_row = ticker[0] if ticker else {}
+    if orderbook_row is None:
+        orderbook, ob_h = await _get("/v1/orderbook", {"markets": market})
+        ob_row = orderbook[0] if orderbook else {}
+    else:
+        ob_row, ob_h = orderbook_row, orderbook_headers or {}
     units = ob_row.get("orderbook_units") or []
     top10_bid = sum(float(u.get("bid_size", 0) or 0) for u in units[:10])
     top10_ask = sum(float(u.get("ask_size", 0) or 0) for u in units[:10])
@@ -909,70 +953,105 @@ def _score_market(analysis: dict[str, Any], ticker_row: dict[str, Any], mode: st
     }
 
 
+def _fast_shortlist(rows: list[dict[str, Any]], size: int) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {"EDGE": [], "AXS": [], "Pre-Breakout": [], "Overheated": []}
+    for row in rows:
+        change = float(row.get("signed_change_rate") or 0) * 100
+        high, low, price = (float(row.get(k) or 0) for k in ("high_price", "low_price", "trade_price"))
+        position = (price - low) / (high - low) if high > low else 0.5
+        group = "Overheated" if change > 18 else "EDGE" if change >= 3 else "AXS" if position < 0.55 else "Pre-Breakout"
+        row["candidate_group"] = group
+        row["prescore"] = _ticker_prescore(row, "day") if group == "EDGE" else math.log10(max(float(row.get("acc_trade_price_24h") or 0), 1)) + position * 2 - abs(change) * 0.1
+        groups[group].append(row)
+    for values in groups.values():
+        values.sort(key=lambda r: r["prescore"], reverse=True)
+    chosen = []
+    # Round-robin guarantees low-change groups participate before momentum fills the pool.
+    while len(chosen) < size:
+        added = False
+        for name in ("EDGE", "AXS", "Pre-Breakout"):
+            if groups[name] and len(chosen) < size:
+                chosen.append(groups[name].pop(0)); added = True
+        if not added:
+            break
+    return chosen
+
+
+def _early_score(tfs: dict[str, Any]) -> float:
+    score = 0.0
+    for t in tfs.values():
+        score += 3 * bool(t.get("macd_bullish")) + 3 * bool(t.get("macd_histogram_rising"))
+        score += 2 * bool(t.get("ema20_above_ema60"))
+        width, prev = t.get("bollinger_width"), t.get("bollinger_width_prev")
+        score += 2 if width is not None and width < 0.08 else 0
+        score += 1 if width is not None and prev is not None and width > prev else 0
+        score += min(float(t.get("volume_ratio20") or 0), 3)
+        rsi = t.get("rsi14")
+        score += 2 if rsi is not None and 40 <= rsi <= 68 else 0
+        score -= 4 if rsi is not None and rsi > 80 else 0
+    return score
+
+
 @mcp.tool()
 async def scan_krw_market(
-    top_n: int = 5,
-    shortlist_size: int = 14,
-    min_turnover_krw: float = 1_000_000_000,
-    mode: str = "swing5d",
+    top_n: int = 5, shortlist_size: int = 24,
+    min_turnover_krw: float = 1_000_000_000, mode: str = "day",
 ) -> dict[str, Any]:
-    """KRW market scanner. mode='day' emphasizes 5m/15m/1h; mode='swing5d' emphasizes 1h/4h/1d, recent multi-day surge risk, and momentum drive profile."""
-    mode = (mode or "swing5d").strip().lower()
+    """FAST: diverse ticker candidates -> 15m/1h -> top six full analysis. Swing remains opt-in."""
+    started = time.monotonic()
+    mode = (mode or "day").strip().lower()
     if mode not in {"day", "swing5d"}:
         raise ValueError("mode must be 'day' or 'swing5d'")
     top_n = max(1, min(int(top_n), 10))
-    shortlist_size = max(top_n, min(int(shortlist_size), 24))
+    shortlist_size = max(top_n, min(int(shortlist_size), 30))
     tickers, headers = await _get("/v1/ticker/all", {"quote_currencies": "KRW"})
-
-    fresh_rows: list[dict[str, Any]] = []
-    for row0 in tickers:
-        if float(row0.get("acc_trade_price_24h", 0) or 0) < float(min_turnover_krw):
-            continue
-        row = dict(row0)
-        row["source_age_seconds"] = _ms_age_seconds(row.get("timestamp"))
-        row["prescore"] = _ticker_prescore(row, mode)
-        fresh_rows.append(row)
-
-    fresh_rows.sort(key=lambda x: x["prescore"], reverse=True)
-    shortlist = fresh_rows[:shortlist_size]
-
-    analyzed: list[dict[str, Any]] = []
-    for row in shortlist:
-        market = row["market"]
+    rows = [dict(r) for r in tickers if float(r.get("acc_trade_price_24h") or 0) >= min_turnover_krw]
+    shortlist = _fast_shortlist(rows, shortlist_size)
+    errors = []
+    async def early(row: dict[str, Any]) -> dict[str, Any] | None:
         try:
-            a = await _analyze_market_full(market)
-            score = _score_market(a, row, mode)
-            analyzed.append({
-                "market": market,
-                "trade_price": row.get("trade_price"),
-                "signed_change_rate": row.get("signed_change_rate"),
-                "acc_trade_price_24h": row.get("acc_trade_price_24h"),
-                "ticker_source_age_seconds": row.get("source_age_seconds"),
-                "prescore": row.get("prescore"),
-                "technical_screen_score": score["total_score"],
-                "score_breakdown": score,
-                "analysis": a,
-            })
-        except Exception as e:
-            analyzed.append({"market": market, "error": f"{type(e).__name__}: {e}"})
-        await asyncio.sleep(0.15)
-
-    valid = [x for x in analyzed if "error" not in x]
-    valid.sort(key=lambda x: x["score_breakdown"]["total_score"], reverse=True)
-
-    return {
-        "received_at_utc": _utc_now_iso(),
-        "mode": mode,
-        "mode_label": "오늘 단타" if mode == "day" else "5일 스윙",
-        "method": "KRW /ticker/all -> shortlist -> 5m/15m/1h/4h/1d + orderbook + recent-surge risk/drive profile",
-        "important": "Scores are deterministic screening scores, not probabilities or promises of future gains.",
-        "ticker_rows": len(tickers),
-        "eligible_rows": len(fresh_rows),
-        "shortlist_size": len(shortlist),
-        "remaining_req": headers.get("remaining-req"),
-        "top_candidates": valid[:top_n],
-        "shortlist_results": analyzed,
-    }
+            values = await asyncio.gather(*(_analyze_tf(row["market"], tf) for tf in ("15m", "60m")))
+            tfs = dict(zip(("15m", "60m"), values))
+            if any(t.get("error") for t in values):
+                raise ValueError("insufficient candles")
+            return {"row": row, "timeframes": tfs, "early_score": _early_score(tfs)}
+        except Exception as exc:
+            errors.append({"market": row["market"], "error": str(exc), "stage": "early"})
+            return None
+    early_results = [r for r in await asyncio.gather(*(early(row) for row in shortlist)) if r is not None]
+    early_results.sort(key=lambda r: r["early_score"], reverse=True)
+    finalists = early_results[:max(6, top_n)]
+    books, book_headers = ([], {})
+    if finalists:
+        books, book_headers = await _get("/v1/orderbook", {"markets": ",".join(r["row"]["market"] for r in finalists)})
+    book_map = {r["market"]: r for r in books}
+    async def full(item: dict[str, Any]) -> dict[str, Any] | None:
+        row = item["row"]
+        try:
+            if row["market"] not in book_map:
+                raise ValueError("missing batch orderbook")
+            a = await _analyze_market_full(row["market"], row, item["timeframes"], book_map[row["market"]], book_headers)
+            score = _score_market(a, a["ticker"], mode)
+            return {"market": row["market"], "trade_price": row.get("trade_price"),
+                    "signed_change_rate": row.get("signed_change_rate"), "acc_trade_price_24h": row.get("acc_trade_price_24h"),
+                    "ticker_source_age_seconds": a["ticker"]["source_age_seconds"], "prescore": row["prescore"],
+                    "candidate_group": row["candidate_group"], "early_score": item["early_score"],
+                    "technical_screen_score": score["total_score"], "score_breakdown": score, "analysis": a}
+        except Exception as exc:
+            errors.append({"market": row["market"], "error": str(exc), "stage": "full"})
+            return None
+    valid = [r for r in await asyncio.gather(*(full(item) for item in finalists)) if r is not None]
+    valid.sort(key=lambda r: r["technical_screen_score"], reverse=True)
+    return {"received_at_utc": _utc_now_iso(), "mode": mode,
+            "mode_label": "오늘 단타 FAST" if mode == "day" else "5일 스윙",
+            "method": "ticker snapshot -> diverse pools -> 15m/1h -> finalists 5m/4h/1d + batch orderbook",
+            "important": "Heuristic screening scores, not probabilities. Ticker groups are proxies, not confirmed patterns.",
+            "ticker_rows": len(tickers), "eligible_rows": len(rows), "shortlist_size": len(shortlist),
+            "full_analysis_count": len(finalists), "elapsed_seconds": round(time.monotonic() - started, 3),
+            "overheated_markets": [r["market"] for r in rows if r.get("candidate_group") == "Overheated"],
+            "remaining_req": headers.get("remaining-req"), "top_candidates": valid[:top_n],
+            "shortlist_results": valid, "errors": errors,
+            "early_results": [{"market": r["row"]["market"], "candidate_group": r["row"]["candidate_group"], "early_score": r["early_score"]} for r in early_results]}
 
 
 def _matches_macd_expansion(t: dict[str, Any], rising_15m: bool = False) -> bool:
@@ -996,15 +1075,7 @@ async def scan_macd_bb_expansion() -> dict[str, Any]:
     tickers, _ = await _get("/v1/ticker/all", {"quote_currencies": "KRW"})
     results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    limiter = asyncio.Lock()
-    next_request = 0.0
-
     async def paced_tf(market: str, tf: str) -> dict[str, Any]:
-        nonlocal next_request
-        async with limiter:
-            now = time.monotonic()
-            await asyncio.sleep(max(0.0, next_request - now))
-            next_request = time.monotonic() + 0.13
         return await _analyze_tf(market, tf)
 
     async def check(row: dict[str, Any]) -> None:
@@ -1075,14 +1146,14 @@ MOBILE_HTML = r'''<!doctype html>
   </style>
 </head>
 <body><div class="wrap">
-  <div class="head"><div><h1>업비트 풀체크 v3</h1><div class="sub">Upbit Public API 직접 조회 · 캐시 대체 없음 · 급등 리스크/드라이브 성향 추가</div></div><div class="badge" id="clock">-</div></div>
+  <div class="head"><div><h1>업비트 풀체크 v3</h1><div class="sub">Upbit Public API 직접 조회 · 현재봉 갱신 · 과거봉 캐시 · 급등 리스크/드라이브 성향 추가</div></div><div class="badge" id="clock">-</div></div>
   <div class="panel"><div class="row"><button id="dayBtn" onclick="runScan('day')">오늘 단타 TOP 5</button><button id="swingBtn" class="swing" onclick="runScan('swing5d')">5일 스윙 TOP 5</button><button id="macdBtn" onclick="runMacdScan()">4개 봉 MACD + 15분 볼밴 확장</button><button class="secondary" onclick="checkHealth()">연결 확인</button></div><div class="modehint">새 버튼: 원화마켓 전체에서 현재 진행 중인 15분·1시간·4시간·1일봉 MACD가 시그널 위에 있고, 15분봉 종가가 시가보다 높으며 15분 볼밴 폭이 직전 봉보다 큰 종목을 전부 표시합니다. 전체 조회에는 시간이 걸릴 수 있습니다.</div><div id="scanStatus" class="status">원하는 모드를 누르세요. 첫 호출은 Render 무료 서버가 깨어나느라 오래 걸릴 수 있습니다.</div></div>
   <div class="panel"><div class="row"><input id="market" value="KRW-QUID" placeholder="예: KRW-BTC"/><button class="secondary" onclick="analyzeOne()">현재 모드로 종목 분석</button></div><div id="oneStatus" class="status"></div></div>
   <div id="results" class="cards"></div>
   <div class="foot">점수는 미래 수익률 확률이 아니라 규칙 기반 스크리닝 점수입니다. 최근 급등 리스크와 드라이브 성향은 3·5·7일 수익률, 7일 런업/고점대비 조정, RSI·볼린저·거래량·호가·MACD 변화로 계산합니다. 현재가·호가·캔들 source age가 오래되면 감점됩니다.</div>
 </div>
 <script>
-const $=id=>document.getElementById(id);let currentMode='swing5d';
+const $=id=>document.getElementById(id);let currentMode='day';
 const fmt=n=>{if(n===null||n===undefined||Number.isNaN(Number(n)))return '-';const x=Number(n);return new Intl.NumberFormat('ko-KR',{maximumFractionDigits:x<10?6:x<100?3:0}).format(x)};
 const won=n=>{if(!n)return '-';const x=Number(n);if(x>=1e12)return(x/1e12).toFixed(2)+'조';if(x>=1e8)return(x/1e8).toFixed(1)+'억';if(x>=1e4)return(x/1e4).toFixed(1)+'만';return fmt(x)};
 const pct=n=>n===null||n===undefined?'-':(Number(n)*100).toFixed(2)+'%';
@@ -1093,7 +1164,7 @@ function tagHtml(tags){return(tags||[]).length?`<div class="tags">${tags.map(t=>
 function card(x,i){const a=x.analysis||x,t=a.ticker||{},m=x.market||a.market||t.market||'-',ch=Number(x.signed_change_rate??t.signed_change_rate??0),cls=ch>=0?'up':'down',ob=a.orderbook_summary||{},tfs=a.timeframes||{},b=x.score_breakdown||x.score||{},label=b.mode_label||'종목 분석',total=b.total_score??x.technical_screen_score;return`<div class="coin"><div class="coinTop"><div><div class="rank">${i?('#'+i):'종목 분석'} · ${label} ${fmt(total)}점</div><div class="market">${m}</div></div><div><div class="price">₩ ${fmt(x.trade_price??t.trade_price)}</div><div class="chg ${cls}">${pct(ch)}</div></div></div>${tagHtml(b.tags)}${scoreGrid(b)}<div class="grid"><div class="metric"><div class="k">24H 거래대금</div><div class="v">${won(x.acc_trade_price_24h??t.acc_trade_price_24h)}</div></div><div class="metric"><div class="k">Ticker age</div><div class="v">${age(x.ticker_source_age_seconds??t.source_age_seconds)}</div></div><div class="metric"><div class="k">Best bid / ask</div><div class="v">${fmt(ob.best_bid)} / ${fmt(ob.best_ask)}</div></div><div class="metric"><div class="k">Top10 호가 imbalance</div><div class="v">${ob.top10_imbalance==null?'-':(Number(ob.top10_imbalance)*100).toFixed(1)+'%'}</div></div></div>${b.recent_surge?`<div class="tf"><div class="tfline"><span class="pill">최근급등</span> 3D ${fmt(b.recent_surge.recent_return_3d_pct)}% · 5D ${fmt(b.recent_surge.recent_return_5d_pct)}% · 7D ${fmt(b.recent_surge.recent_return_7d_pct)}% · 7D저점대비 ${fmt(b.recent_surge.runup_7d_pct)}% · 7D고점대비 ${fmt(b.recent_surge.drawdown_from_7d_high_pct)}%</div></div>`:''}<div class="tf"><div class="tfline"><span class="pill">5m</span> ${tfSummary(tfs['5m'])}</div><div class="tfline"><span class="pill">15m</span> ${tfSummary(tfs['15m'])}</div><div class="tfline"><span class="pill">1h</span> ${tfSummary(tfs['60m'])}</div><div class="tfline"><span class="pill">4h</span> ${tfSummary(tfs['240m'])}</div><div class="tfline"><span class="pill">1d</span> ${tfSummary(tfs['1d'])}</div></div></div>`}
 async function fetchJSON(url,opt){const r=await fetch(url,opt),tx=await r.text();let j;try{j=JSON.parse(tx)}catch(e){throw new Error(`HTTP ${r.status}: ${tx.slice(0,180)}`)}if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j}
 async function checkHealth(){const s=$('scanStatus');s.className='status';s.innerHTML='<span class="spinner"></span>업비트 연결 확인 중...';try{const j=await fetchJSON('/api/health');s.className='status good';s.textContent=`정상 · KRW-BTC ${fmt(j.sample?.trade_price)}원 · 데이터 age ${age(j.source_age_seconds)}`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
-async function runScan(mode){currentMode=mode;const db=$('dayBtn'),sb=$('swingBtn'),s=$('scanStatus'),r=$('results');db.disabled=true;sb.disabled=true;s.className='status';const isSwing=mode==='swing5d';s.innerHTML=`<span class="spinner"></span>${isSwing?'5일 스윙':'오늘 단타'}: KRW 전체 Ticker → 후보 압축 → 5m/15m/1h/4h/1d + 호가 분석 중...`;r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,top_n:5,shortlist_size:isSwing?18:10,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('');s.className='status good';s.textContent=`${j.mode_label} 완료 · 전체 ${j.ticker_rows}개 / 조건통과 ${j.eligible_rows}개 / 정밀분석 ${j.shortlist_size}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{db.disabled=false;sb.disabled=false}}
+async function runScan(mode){currentMode=mode;const db=$('dayBtn'),sb=$('swingBtn'),s=$('scanStatus'),r=$('results');db.disabled=true;sb.disabled=true;s.className='status';const isSwing=mode==='swing5d';s.innerHTML=`<span class="spinner"></span>${isSwing?'5일 스윙':'오늘 단타'}: KRW 전체 → 다중 후보 → 15분·1시간 → 상위 후보 정밀분석 중...`;r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,top_n:5,shortlist_size:24,min_turnover_krw:1000000000})});r.innerHTML=(j.top_candidates||[]).map((x,i)=>card(x,i+1)).join('');s.className='status good';s.textContent=`${j.mode_label} 완료 · 전체 ${j.ticker_rows}개 / 조건통과 ${j.eligible_rows}개 / 1차 ${j.shortlist_size}개 / 정밀 ${j.full_analysis_count}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{db.disabled=false;sb.disabled=false}}
 async function runMacdScan(){const btn=$('macdBtn'),s=$('scanStatus'),r=$('results');btn.disabled=true;s.className='status';s.innerHTML='<span class="spinner"></span>원화마켓 전체 15분봉 검사 및 조건 후보의 1시간·4시간·일봉 확인 중...';r.innerHTML='';const st=Date.now();try{const j=await fetchJSON('/api/scan/macd-bb',{method:'POST'});r.innerHTML=(j.matches||[]).map(x=>`<div class="coin"><div class="coinTop"><div class="market">${x.market}</div><div><div class="price">₩ ${fmt(x.trade_price)}</div><div class="chg ${Number(x.signed_change_rate)>=0?'up':'down'}">${pct(x.signed_change_rate)}</div></div></div><div class="tf">${[['15m','15분'],['60m','1시간'],['240m','4시간'],['1d','1일']].map(([k,n])=>`<div class="tfline"><span class="pill">${n}</span> MACD ${fmt(x.timeframes[k].macd)} &gt; Signal ${fmt(x.timeframes[k].signal)}</div>`).join('')}<div class="tfline">15분 볼밴 폭 ${fmt(x.timeframes['15m'].bb_width_prev)} → ${fmt(x.timeframes['15m'].bb_width)}</div></div></div>`).join('')||'<div class="coin">조건에 맞는 코인이 없습니다.</div>';s.className='status good';s.textContent=`전체 ${j.ticker_rows}개 중 ${j.match_count}개 일치 · 조회 실패 ${j.errors.length}개 · ${((Date.now()-st)/1000).toFixed(1)}초`;}catch(e){s.className='status bad';s.textContent='실패: '+e.message}finally{btn.disabled=false}}
 async function analyzeOne(){const m=$('market').value.trim().toUpperCase(),s=$('oneStatus'),r=$('results');if(!m)return;s.className='status';s.innerHTML='<span class="spinner"></span>'+m+' 분석 중...';try{const j=await fetchJSON('/api/analyze?market='+encodeURIComponent(m)+'&mode='+encodeURIComponent(currentMode));r.innerHTML=card(j,0);s.className='status good';s.textContent='완료 · '+(j.score_breakdown?.mode_label||'공식 Upbit Public API');}catch(e){s.className='status bad';s.textContent='실패: '+e.message}}
 setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})},1000);checkHealth();
@@ -1118,9 +1189,9 @@ async def api_analyze(request: Request) -> Response:
     market = (request.query_params.get("market") or "").strip().upper()
     if not market:
         return JSONResponse({"error": "market is required, e.g. KRW-BTC"}, status_code=400)
-    mode = (request.query_params.get("mode") or "swing5d").strip().lower()
+    mode = (request.query_params.get("mode") or "day").strip().lower()
     if mode not in {"day", "swing5d"}:
-        mode = "swing5d"
+        mode = "day"
     try:
         data = await _analyze_market_full(market)
         ticker_row = data.get("ticker", {}) if isinstance(data, dict) else {}
@@ -1150,9 +1221,9 @@ async def api_scan(request: Request) -> Response:
     try:
         data = await scan_krw_market(
             top_n=int(body.get("top_n", 5)),
-            shortlist_size=int(body.get("shortlist_size", 14)),
+            shortlist_size=int(body.get("shortlist_size", 24)),
             min_turnover_krw=float(body.get("min_turnover_krw", 1_000_000_000)),
-            mode=str(body.get("mode", "swing5d")),
+            mode=str(body.get("mode", "day")),
         )
         return JSONResponse(data, headers={"Cache-Control": "no-store"})
     except Exception as e:
